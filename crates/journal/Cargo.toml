@@ -16,12 +16,21 @@ doctest = false
 anyhow.workspace = true
 chrono.workspace = true
 editor.workspace = true
+fuzzy.workspace = true
 gpui.workspace = true
+language.workspace = true
 log.workspace = true
+menu.workspace = true
+multi_buffer.workspace = true
+picker.workspace = true
 serde.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
 workspace.workspace = true
+paths.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }
