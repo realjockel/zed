@@ -729,6 +729,28 @@ pub struct JournalSettingsContent {
     ///
     /// Default: hour12
     pub hour_format: Option<HourFormat>,
+    /// Capture templates for quick note-taking
+    pub capture_templates: Option<Vec<CaptureTemplateConfig>>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct CaptureTemplateConfig {
+    /// The name of the template
+    pub name: String,
+    /// The template content, with variables like {date}, {time}, {input}, {selection}, {link}, {file}, {tags}
+    pub template: String,
+    /// Optional description
+    pub description: Option<String>,
+    /// Target file to append to (relative to journal directory, e.g. "inbox.md" or "2025/11/10.md")
+    /// If None, prompts user to select a journal entry
+    pub target: Option<String>,
+    /// Whether to prompt for input text
+    pub prompt_for_input: Option<bool>,
+    /// Prompt text to show when asking for input
+    pub input_prompt: Option<String>,
+    /// Whether to prompt for tags
+    pub prompt_for_tags: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
