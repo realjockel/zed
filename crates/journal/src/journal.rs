@@ -1,6 +1,6 @@
 use chrono::{Datelike, Local, NaiveTime, Timelike};
 use editor::scroll::Autoscroll;
-use editor::{self, Editor, SelectionEffects, ToOffset, ToPoint};
+use editor::{self, Editor, SelectionEffects, ToPoint};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
@@ -8,8 +8,9 @@ use gpui::{
     Window, actions,
 };
 use language::Point;
+use language::ToOffset as _;
 use menu;
-use multi_buffer::{ExcerptRange, MultiBufferSnapshot};
+use multi_buffer::{ExcerptRange, MultiBufferSnapshot, ToOffset as _};
 use picker::{Picker, PickerDelegate};
 pub use settings::HourFormat;
 use settings::{ActiveSettingsProfileName, CaptureTemplateConfig, RegisterSetting, Settings};
@@ -43,6 +44,8 @@ actions!(
         UnfocusSection,
         /// Cycles fold state of current section (folded -> children -> expanded).
         CycleFold,
+        /// Cycles the TODO state of the current headline (TODO -> DOING -> DONE, etc.).
+        CycleTodoState,
     ]
 );
 
@@ -59,6 +62,12 @@ pub struct JournalSettings {
     pub hour_format: HourFormat,
     /// Capture templates for quick note-taking
     pub capture_templates: Vec<CaptureTemplateConfig>,
+    /// TODO keywords that represent active states
+    pub todo_keywords: Vec<String>,
+    /// TODO keywords that represent done/completed states
+    pub done_keywords: Vec<String>,
+    /// Whether to add a timestamp when a task is marked as done
+    pub timestamp_on_done: bool,
 }
 
 impl settings::Settings for JournalSettings {
@@ -69,6 +78,17 @@ impl settings::Settings for JournalSettings {
             path: journal.path.unwrap(),
             hour_format: journal.hour_format.unwrap(),
             capture_templates: journal.capture_templates.unwrap_or_default(),
+            todo_keywords: journal.todo_keywords.unwrap_or_else(|| {
+                vec![
+                    "TODO".to_string(),
+                    "DOING".to_string(),
+                    "WAITING".to_string(),
+                ]
+            }),
+            done_keywords: journal
+                .done_keywords
+                .unwrap_or_else(|| vec!["DONE".to_string(), "CANCELLED".to_string()]),
+            timestamp_on_done: journal.timestamp_on_done.unwrap_or(true),
         }
     }
 }
@@ -113,6 +133,9 @@ pub fn init(_: Arc<AppState>, cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &CycleFold, window, cx| {
                 cycle_fold(workspace, window, cx);
+            });
+            workspace.register_action(|workspace, _: &CycleTodoState, window, cx| {
+                cycle_todo_state(workspace, window, cx);
             });
 
             // Observe active pane changes to automatically enable/disable zen mode
@@ -527,6 +550,202 @@ pub fn cycle_fold(workspace: &mut Workspace, window: &mut Window, cx: &mut Conte
             // Fold the entire section
             editor.fold_at(multi_buffer::MultiBufferRow(fold_start_row), window, cx);
         }
+    });
+}
+
+pub fn cycle_todo_state(
+    workspace: &mut Workspace,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        return;
+    };
+
+    let settings = JournalSettings::get_global(cx);
+    let todo_keywords = settings.todo_keywords.clone();
+    let done_keywords = settings.done_keywords.clone();
+    let timestamp_on_done = settings.timestamp_on_done;
+
+    editor.update(cx, |editor, cx| {
+        let buffer = editor.buffer().read(cx);
+        let Some(singleton_buffer) = buffer.as_singleton() else {
+            log::warn!("Buffer is not a singleton");
+            return;
+        };
+
+        let buffer_snapshot = singleton_buffer.read(cx).snapshot();
+
+        // Get current cursor position
+        let cursor_position = editor.selections.newest_anchor().head();
+
+        // The multi-buffer Anchor contains the text_anchor which is the buffer anchor
+        let buffer_anchor = cursor_position.text_anchor;
+        let buffer_offset = buffer_anchor.to_offset(&buffer_snapshot);
+
+        // Use tree-sitter to find the headline node at cursor position
+        let headline_node = buffer_snapshot.syntax_ancestor(buffer_offset..buffer_offset);
+
+        let Some(mut headline_node) = headline_node else {
+            log::info!("No syntax node at cursor position");
+            return;
+        };
+
+        // Walk up the tree to find a headline node
+        while headline_node.kind() != "headline" {
+            if let Some(parent) = headline_node.parent() {
+                headline_node = parent;
+            } else {
+                log::info!("Not on a headline");
+                return;
+            }
+        }
+
+        // Find the stars and item nodes within the headline
+        let mut stars_node = None;
+        let mut item_node = None;
+        let mut cursor = headline_node.walk();
+
+        for child in headline_node.children(&mut cursor) {
+            match child.kind() {
+                "stars" => stars_node = Some(child),
+                "item" => item_node = Some(child),
+                _ => {}
+            }
+        }
+
+        let Some(stars_node) = stars_node else {
+            log::warn!("Headline missing stars node");
+            return;
+        };
+
+        let Some(item_node) = item_node else {
+            log::warn!("Headline missing item node");
+            return;
+        };
+
+        // Build all possible keywords (todo + done)
+        let mut all_keywords = todo_keywords.clone();
+        all_keywords.extend(done_keywords.clone());
+
+        // Check if the item has a TODO keyword - it's the first child expr node
+        let mut current_keyword: Option<String> = None;
+        let mut keyword_node = None;
+        let mut item_cursor = item_node.walk();
+
+        for child in item_node.children(&mut item_cursor) {
+            if child.kind() == "expr" {
+                let text = buffer_snapshot
+                    .text_for_range(child.byte_range())
+                    .collect::<String>();
+                if all_keywords.iter().any(|kw| kw == &text) {
+                    current_keyword = Some(text);
+                    keyword_node = Some(child);
+                }
+                break; // Only check the first expr node
+            }
+        }
+
+        let (new_keyword, add_timestamp) = if let Some(ref keyword) = current_keyword {
+            // Find the next keyword in the cycle
+            let current_is_done = done_keywords.contains(keyword);
+
+            // Cycle: TODO keywords → DONE keywords → remove keyword (cycle back to start)
+            if current_is_done {
+                // If it's a done keyword and it's the last one, remove the keyword entirely
+                let current_idx = done_keywords.iter().position(|k| k == keyword).unwrap();
+                if current_idx + 1 >= done_keywords.len() {
+                    (None, false) // Remove keyword
+                } else {
+                    (Some(done_keywords[current_idx + 1].clone()), false)
+                }
+            } else {
+                // It's a TODO keyword - cycle through todo keywords first
+                let current_idx = todo_keywords.iter().position(|k| k == keyword).unwrap();
+                if current_idx + 1 >= todo_keywords.len() {
+                    // Move to first DONE keyword
+                    if !done_keywords.is_empty() {
+                        (Some(done_keywords[0].clone()), timestamp_on_done)
+                    } else {
+                        (None, false) // No done keywords, remove
+                    }
+                } else {
+                    (Some(todo_keywords[current_idx + 1].clone()), false)
+                }
+            }
+        } else {
+            // No keyword found, add the first TODO keyword
+            if !todo_keywords.is_empty() {
+                (Some(todo_keywords[0].clone()), false)
+            } else {
+                log::warn!("No TODO keywords configured");
+                return;
+            }
+        };
+
+        // Now construct the edit based on the new keyword
+        let edit_range;
+        let new_text;
+
+        if let Some(new_kw) = new_keyword {
+            if let Some(kw_node) = keyword_node {
+                // Replace existing keyword
+                edit_range = kw_node.byte_range();
+                new_text = if add_timestamp {
+                    let now = Local::now();
+                    format!("{} CLOSED: [{}]", new_kw, now.format("%Y-%m-%d %a %H:%M"))
+                } else {
+                    new_kw.clone()
+                };
+            } else {
+                // Insert new keyword after stars
+                let insert_pos = stars_node.end_byte();
+                edit_range = insert_pos..insert_pos;
+                new_text = format!(" {}", new_kw);
+            }
+        } else {
+            // Remove keyword (and CLOSED timestamp if present)
+            if let Some(kw_node) = keyword_node {
+                let item_text = buffer_snapshot
+                    .text_for_range(item_node.byte_range())
+                    .collect::<String>();
+
+                // Check if there's a CLOSED timestamp to remove
+                if let Some(closed_pos) = item_text.find("CLOSED:") {
+                    if let Some(bracket_end) = item_text[closed_pos..].find(']') {
+                        // Remove from keyword start to end of timestamp
+                        let timestamp_end = item_node.start_byte() + closed_pos + bracket_end + 1;
+
+                        // Get the text after the timestamp and preserve it
+                        let after_timestamp = buffer_snapshot
+                            .text_for_range(timestamp_end..item_node.end_byte())
+                            .collect::<String>();
+
+                        edit_range = kw_node.start_byte()..timestamp_end;
+                        new_text = after_timestamp.trim_start().to_string();
+                    } else {
+                        // Just remove the keyword
+                        edit_range = kw_node.byte_range();
+                        new_text = String::new();
+                    }
+                } else {
+                    // Just remove the keyword
+                    edit_range = kw_node.byte_range();
+                    new_text = String::new();
+                }
+            } else {
+                // Nothing to do
+                return;
+            }
+        };
+
+        // Apply the edit
+        singleton_buffer.update(cx, |buffer, cx| {
+            buffer.edit([(edit_range, new_text)], None, cx);
+        });
     });
 }
 

@@ -731,6 +731,18 @@ pub struct JournalSettingsContent {
     pub hour_format: Option<HourFormat>,
     /// Capture templates for quick note-taking
     pub capture_templates: Option<Vec<CaptureTemplateConfig>>,
+    /// TODO keywords that represent active states
+    ///
+    /// Default: ["TODO", "DOING", "WAITING"]
+    pub todo_keywords: Option<Vec<String>>,
+    /// TODO keywords that represent done/completed states
+    ///
+    /// Default: ["DONE", "CANCELLED"]
+    pub done_keywords: Option<Vec<String>>,
+    /// Whether to add a timestamp when a task is marked as done
+    ///
+    /// Default: true
+    pub timestamp_on_done: Option<bool>,
 }
 
 #[skip_serializing_none]
