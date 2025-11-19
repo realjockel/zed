@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, NaiveTime, Timelike};
+use chrono::{Local, NaiveTime, Timelike};
 use editor::scroll::Autoscroll;
 use editor::{self, Editor, SelectionEffects, ToPoint};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
@@ -7,11 +7,13 @@ use gpui::{
     Focusable, Global, IntoElement, ParentElement, Render, Styled, Subscription, WeakEntity,
     Window, actions,
 };
-use language::Point;
 use language::ToOffset as _;
+use language::{Point, ToPoint as _};
+use lsp::CompletionContext;
 use menu;
 use multi_buffer::{ExcerptRange, MultiBufferSnapshot, ToOffset as _};
 use picker::{Picker, PickerDelegate};
+use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 pub use settings::HourFormat;
 use settings::{ActiveSettingsProfileName, CaptureTemplateConfig, RegisterSetting, Settings};
 use std::{
@@ -21,6 +23,7 @@ use std::{
     sync::Arc,
 };
 use theme::ActiveTheme;
+use tree_sitter;
 use ui::{HighlightedLabel, Label, LabelSize, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt;
 use util::paths::PathStyle;
@@ -107,6 +110,31 @@ const JOURNAL_ZEN_PROFILE: &str = "journal-zen";
 
 pub fn init(_: Arc<AppState>, cx: &mut App) {
     cx.set_global(JournalZenModeState::default());
+
+    // Register tag completion provider for org-mode files
+    cx.observe_new(|editor: &mut Editor, _window, cx| {
+        let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+            return;
+        };
+
+        let Some(file) = buffer.read(cx).file() else {
+            return;
+        };
+
+        let path = file.path();
+        log::info!("Journal: Checking file for tag completion: {:?}", path);
+
+        if let Some(extension) = path.extension() {
+            log::info!("Journal: File extension: {:?}", extension);
+            if extension == "org" {
+                log::info!("Journal: Setting tag completion provider for {:?}", path);
+                // This is an org-mode file, register tag completion
+                editor
+                    .set_completion_provider(Some(std::rc::Rc::new(TagCompletionProvider::new())));
+            }
+        }
+    })
+    .detach();
 
     cx.observe_new(
         |workspace: &mut Workspace, window, cx: &mut Context<Workspace>| {
@@ -698,7 +726,7 @@ pub fn cycle_todo_state(
                     let now = Local::now();
                     format!("{} CLOSED: [{}]", new_kw, now.format("%Y-%m-%d %a %H:%M"))
                 } else {
-                    new_kw.clone()
+                    new_kw
                 };
             } else {
                 // Insert new keyword after stars
@@ -791,21 +819,24 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
     let journal_dir_clone = journal_dir.clone();
 
     let now = Local::now();
-    let month_dir = journal_dir
-        .join(format!("{:02}", now.year()))
-        .join(format!("{:02}", now.month()));
-    let entry_path = month_dir.join(format!("{:02}.md", now.day()));
-    let now = now.time();
-    let entry_heading = heading_entry(now, &settings.hour_format);
+    let entry_path = journal_dir.join("journal.org");
+    let date_heading = format!("* {}", now.format("%Y-%m-%d %A"));
+    let time_heading = time_heading(now.time(), &settings.hour_format);
 
     let create_entry = cx.background_spawn(async move {
-        std::fs::create_dir_all(month_dir)?;
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&entry_path)?;
-        Ok::<_, std::io::Error>((journal_dir, entry_path))
+        std::fs::create_dir_all(&journal_dir)?;
+
+        // Read existing content
+        let existing_content = if entry_path.exists() {
+            std::fs::read_to_string(&entry_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Check if today's date heading exists
+        let needs_date_heading = !existing_content.contains(&date_heading);
+
+        Ok::<_, std::io::Error>((journal_dir, entry_path, needs_date_heading, date_heading))
     });
 
     let worktrees = workspace.visible_worktrees(cx).collect::<Vec<_>>();
@@ -830,7 +861,7 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
 
     window
         .spawn(cx, async move |cx| {
-            let (journal_dir, entry_path) = create_entry.await?;
+            let (journal_dir, entry_path, needs_date_heading, date_heading) = create_entry.await?;
             let opened = if open_new_workspace {
                 let (new_workspace, _) = cx
                     .update(|_window, cx| {
@@ -887,7 +918,13 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
                     if len.0 > 0 {
                         editor.insert("\n\n", window, cx);
                     }
-                    editor.insert(&entry_heading, window, cx);
+                    // Add date heading if needed
+                    if needs_date_heading {
+                        editor.insert(&date_heading, window, cx);
+                        editor.insert("\n\n", window, cx);
+                    }
+                    // Add time heading
+                    editor.insert(&time_heading, window, cx);
                     editor.insert("\n\n", window, cx);
                 })?;
             }
@@ -909,18 +946,22 @@ fn journal_dir(path: &str) -> Option<PathBuf> {
     Some(absolute_path.join("journal"))
 }
 
-fn heading_entry(now: NaiveTime, hour_format: &HourFormat) -> String {
+fn time_heading(now: NaiveTime, hour_format: &HourFormat) -> String {
     match hour_format {
         HourFormat::Hour24 => {
             let hour = now.hour();
-            format!("# {}:{:02}", hour, now.minute())
+            format!("** {}:{:02}", hour, now.minute())
         }
         HourFormat::Hour12 => {
             let (pm, hour) = now.hour12();
             let am_or_pm = if pm { "PM" } else { "AM" };
-            format!("# {}:{:02} {}", hour, now.minute(), am_or_pm)
+            format!("** {}:{:02} {}", hour, now.minute(), am_or_pm)
         }
     }
+}
+
+fn heading_entry(now: NaiveTime, hour_format: &HourFormat) -> String {
+    time_heading(now, hour_format)
 }
 
 pub struct JournalEntryPicker {
@@ -1092,8 +1133,8 @@ impl CaptureTemplatePickerDelegate {
                 if path.is_dir() {
                     // Recursively scan subdirectories
                     Self::scan_tags_recursive(&path, &mut tags);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    // Scan markdown file for tags
+                } else if path.extension().and_then(|s| s.to_str()) == Some("org") {
+                    // Scan org-mode file for tags
                     Self::extract_tags_from_file(&path, &mut tags);
                 }
             }
@@ -1110,7 +1151,7 @@ impl CaptureTemplatePickerDelegate {
                 let path = entry.path();
                 if path.is_dir() {
                     Self::scan_tags_recursive(&path, tags);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                } else if path.extension().and_then(|s| s.to_str()) == Some("org") {
                     Self::extract_tags_from_file(&path, tags);
                 }
             }
@@ -1276,11 +1317,7 @@ impl CaptureTemplatePickerDelegate {
                     });
                 } else if let Some(journal_dir) = &journal_dir {
                     // Open today's journal and insert
-                    let now = chrono::Local::now();
-                    let target_path = journal_dir
-                        .join(format!("{:04}", now.year()))
-                        .join(format!("{:02}", now.month()))
-                        .join(format!("{:02}.md", now.day()));
+                    let target_path = journal_dir.join("journal.org");
                     let content = format!("{}\n\n", expanded);
 
                     cx.background_spawn(async move {
@@ -1298,11 +1335,7 @@ impl CaptureTemplatePickerDelegate {
                 }
             } else if let Some(journal_dir) = &journal_dir {
                 // No editor active, append to today's journal
-                let now = chrono::Local::now();
-                let target_path = journal_dir
-                    .join(format!("{:04}", now.year()))
-                    .join(format!("{:02}", now.month()))
-                    .join(format!("{:02}.md", now.day()));
+                let target_path = journal_dir.join("journal.org");
                 let content = format!("{}\n\n", expanded);
 
                 cx.background_spawn(async move {
@@ -1704,7 +1737,7 @@ impl JournalEntryPickerDelegate {
                         if let Ok(day_files) = std::fs::read_dir(month_entry.path()) {
                             for day_file in day_files.flatten() {
                                 let path = day_file.path();
-                                if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                                if path.extension().and_then(|s| s.to_str()) == Some("org") {
                                     if let Some(display_name) = Self::format_entry_name(&path) {
                                         entries.push(StringMatchCandidate::new(
                                             candidate_id,
@@ -1727,7 +1760,7 @@ impl JournalEntryPickerDelegate {
     fn format_entry_name(path: &Path) -> Option<String> {
         let components: Vec<_> = path.components().rev().take(3).collect();
         if components.len() >= 3 {
-            let day = components[0].as_os_str().to_str()?.trim_end_matches(".md");
+            let day = components[0].as_os_str().to_str()?.trim_end_matches(".org");
             let month = components[1].as_os_str().to_str()?;
             let year = components[2].as_os_str().to_str()?;
             Some(format!("{}/{}/{}", year, month, day))
@@ -1744,7 +1777,7 @@ impl JournalEntryPickerDelegate {
                 .journal_dir
                 .join(parts[0])
                 .join(parts[1])
-                .join(format!("{}.md", parts[2]));
+                .join(format!("{}.org", parts[2]));
             Some(path)
         } else {
             None
@@ -2258,6 +2291,380 @@ impl PickerDelegate for TagPickerDelegate {
                         )),
                 ),
         )
+    }
+}
+
+// Tag completion provider for org-mode files
+pub struct TagCompletionProvider {}
+
+impl TagCompletionProvider {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    fn collect_tags_from_journal_directory(cx: &mut Context<Editor>) -> Vec<String> {
+        let settings = JournalSettings::get_global(cx);
+        let Some(journal_dir) = journal_dir(&settings.path) else {
+            log::info!("Could not determine journal directory for tag collection");
+            return Vec::new();
+        };
+
+        let mut all_tags = std::collections::HashSet::new();
+
+        // Recursively scan all .org files in journal directory
+        fn scan_directory(dir: &std::path::Path, tags: &mut std::collections::HashSet<String>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan_directory(&path, tags);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("org") {
+                        // Parse the file and extract tags
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            // Simple regex-based extraction for now (could use tree-sitter but this is faster)
+                            // Match tags in headlines: :tag1:tag2:
+                            let tag_regex = regex::Regex::new(r":([a-zA-Z0-9_@]+):").unwrap();
+                            for cap in tag_regex.captures_iter(&content) {
+                                if let Some(tag_match) = cap.get(1) {
+                                    let tag = tag_match.as_str();
+                                    tags.insert(tag.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        log::info!("Scanning journal directory for tags: {:?}", journal_dir);
+        scan_directory(&journal_dir, &mut all_tags);
+        log::info!(
+            "Found {} unique tags across all journal files",
+            all_tags.len()
+        );
+
+        all_tags.into_iter().collect()
+    }
+
+    fn collect_inherited_tags(buffer: &language::BufferSnapshot, current_row: u32) -> Vec<String> {
+        // Get the syntax layer
+        let Some(layer) = buffer.syntax_layers().next() else {
+            return Vec::new();
+        };
+
+        let root_node = layer.node();
+
+        // Find all headlines and their tags, tracking hierarchy
+        let mut headlines_with_tags: Vec<(u32, u32, Vec<String>)> = Vec::new(); // (row, level, tags)
+
+        fn collect_headlines<'a>(
+            node: tree_sitter::Node<'a>,
+            buffer: &language::BufferSnapshot,
+            headlines: &mut Vec<(u32, u32, Vec<String>)>,
+        ) {
+            if node.kind() == "headline" {
+                let row = node.start_position().row as u32;
+
+                // Count stars to determine level
+                let mut star_count = 0;
+                let mut tags = Vec::new();
+
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "stars" {
+                        let stars_text = buffer
+                            .text_for_range(child.byte_range())
+                            .collect::<String>();
+                        star_count = stars_text.chars().filter(|c| *c == '*').count() as u32;
+                    } else if child.kind() == "tag_list" {
+                        // Extract all tags from this tag_list
+                        let mut tag_cursor = child.walk();
+                        for tag_child in child.children(&mut tag_cursor) {
+                            if tag_child.kind() == "tag" {
+                                let tag_text = buffer
+                                    .text_for_range(tag_child.byte_range())
+                                    .collect::<String>();
+                                let clean_tag = tag_text.trim_matches(':');
+                                if !clean_tag.is_empty() {
+                                    tags.push(clean_tag.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                headlines.push((row, star_count, tags));
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_headlines(child, buffer, headlines);
+            }
+        }
+
+        collect_headlines(root_node, buffer, &mut headlines_with_tags);
+
+        // Find the current headline and collect inherited tags
+        let mut inherited_tags = Vec::new();
+        let mut current_level = None;
+
+        // First, find the current headline's level
+        for (row, level, _tags) in &headlines_with_tags {
+            if *row == current_row {
+                current_level = Some(*level);
+                break;
+            }
+        }
+
+        if let Some(curr_level) = current_level {
+            // Walk backwards through headlines to find ancestors
+            for (row, level, tags) in headlines_with_tags.iter().rev() {
+                if *row < current_row && *level < curr_level {
+                    // This is an ancestor headline, inherit its tags
+                    for tag in tags {
+                        if !inherited_tags.contains(tag) {
+                            inherited_tags.push(tag.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        inherited_tags
+    }
+
+    fn collect_tags_from_buffer(buffer: &language::BufferSnapshot) -> Vec<String> {
+        let mut tags = std::collections::HashSet::new();
+
+        // Get the syntax layers - org-mode files have language at layer 0
+        let Some(layer) = buffer.syntax_layers().next() else {
+            log::info!("No syntax layers found in buffer");
+            return Vec::new();
+        };
+
+        log::info!("Found syntax layer");
+
+        let root_node = layer.node();
+
+        // Simpler approach: recursively visit all nodes
+        fn visit_node<'a>(
+            node: tree_sitter::Node<'a>,
+            buffer: &language::BufferSnapshot,
+            tags: &mut std::collections::HashSet<String>,
+            depth: usize,
+        ) {
+            // Check if this is a tag node
+            if node.kind() == "tag" {
+                let tag_text = buffer.text_for_range(node.byte_range()).collect::<String>();
+                let start = node.start_position();
+                let end = node.end_position();
+                log::info!(
+                    "{}[TAG] at line {}, col {}-{}: raw={:?}",
+                    "  ".repeat(depth),
+                    start.row + 1,
+                    start.column,
+                    end.column,
+                    tag_text
+                );
+                // Tag text includes the colons like ":tag:", so strip them
+                let clean_tag = tag_text.trim_matches(':');
+                if !clean_tag.is_empty() {
+                    tags.insert(clean_tag.to_string());
+                    log::info!("{}  -> cleaned: {}", "  ".repeat(depth), clean_tag);
+                }
+            }
+
+            // Log headline nodes to see context
+            if node.kind() == "headline" {
+                let headline_text = buffer.text_for_range(node.byte_range()).collect::<String>();
+                let start = node.start_position();
+                log::info!(
+                    "{}[HEADLINE] at line {}: {:?}",
+                    "  ".repeat(depth),
+                    start.row + 1,
+                    headline_text
+                        .trim_end()
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
+                );
+            }
+
+            // Recursively visit children
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                visit_node(child, buffer, tags, depth + 1);
+            }
+        }
+
+        visit_node(root_node, buffer, &mut tags, 0);
+
+        log::info!("Total tags collected: {}", tags.len());
+        let result: Vec<String> = tags.into_iter().collect();
+        log::info!("Tags: {:?}", result);
+        result
+    }
+}
+
+impl editor::CompletionProvider for TagCompletionProvider {
+    fn completions(
+        &self,
+        _excerpt_id: editor::ExcerptId,
+        buffer: &Entity<language::Buffer>,
+        buffer_position: language::Anchor,
+        _trigger: CompletionContext,
+        _window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> gpui::Task<anyhow::Result<Vec<CompletionResponse>>> {
+        log::info!("TagCompletionProvider::completions called");
+
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        let position = buffer_position.to_point(&buffer_snapshot);
+        let line_start = language::Point::new(position.row, 0);
+        let line_end = language::Point::new(position.row, position.column);
+
+        let line_text = buffer_snapshot
+            .text_for_range(line_start..line_end)
+            .collect::<String>();
+
+        log::info!("Completions line_text: {:?}", line_text);
+
+        // Check if we're on a headline and after a colon
+        let trimmed = line_text.trim_start();
+        if !trimmed.starts_with('*') {
+            log::info!("Not on a headline, returning empty");
+            return gpui::Task::ready(Ok(Vec::new()));
+        }
+
+        // Find the last colon before cursor
+        let Some(last_colon_pos) = line_text.rfind(':') else {
+            log::info!("No colon found, returning empty");
+            return gpui::Task::ready(Ok(Vec::new()));
+        };
+
+        log::info!("Found colon at position {}", last_colon_pos);
+
+        // Extract the partial tag being typed
+        let partial_tag = &line_text[last_colon_pos + 1..];
+
+        // Get tags from current buffer
+        let mut all_tags = Self::collect_tags_from_buffer(&buffer_snapshot);
+
+        // Collect inherited tags from parent headlines
+        let inherited_tags = Self::collect_inherited_tags(&buffer_snapshot, position.row);
+
+        // Collect tags from all journal files
+        let journal_tags = Self::collect_tags_from_journal_directory(cx);
+
+        // Merge all tag sources
+        for tag in &inherited_tags {
+            if !all_tags.contains(tag) {
+                all_tags.push(tag.clone());
+            }
+        }
+
+        for tag in &journal_tags {
+            if !all_tags.contains(tag) {
+                all_tags.push(tag.clone());
+            }
+        }
+
+        log::info!(
+            "Collected {} tags total (buffer: {}, inherited: {}, journal: {})",
+            all_tags.len(),
+            Self::collect_tags_from_buffer(&buffer_snapshot).len(),
+            inherited_tags.len(),
+            journal_tags.len()
+        );
+
+        // Filter tags based on partial input
+        let partial_tag_lower = partial_tag.to_lowercase();
+        all_tags.retain(|tag| tag.to_lowercase().contains(&partial_tag_lower));
+        all_tags.sort();
+        all_tags.dedup();
+
+        log::info!(
+            "After filtering by '{}': {} tags: {:?}",
+            partial_tag,
+            all_tags.len(),
+            all_tags
+        );
+
+        // Convert to range for replacement
+        let line_offset = buffer_snapshot.point_to_offset(line_start);
+        let start_offset = line_offset + last_colon_pos + 1;
+        let end_offset = line_offset + line_text.len();
+
+        let replace_start = buffer_snapshot.anchor_before(start_offset);
+        let replace_end = buffer_snapshot.anchor_after(end_offset);
+
+        // Create completions
+        let completions = all_tags
+            .into_iter()
+            .map(|tag| Completion {
+                replace_range: replace_start..replace_end,
+                new_text: format!("{}:", tag),
+                label: language::CodeLabel::plain(tag, None),
+                documentation: None,
+                source: CompletionSource::Custom,
+                icon_path: Some(ui::IconName::Hash.path().into()),
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+            })
+            .collect();
+
+        gpui::Task::ready(Ok(vec![CompletionResponse {
+            completions,
+            display_options: CompletionDisplayOptions::default(),
+            is_incomplete: false,
+        }]))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        position: language::Anchor,
+        text: &str,
+        _trigger_in_words: bool,
+        _menu_is_open: bool,
+        cx: &mut Context<Editor>,
+    ) -> bool {
+        log::info!(
+            "TagCompletionProvider::is_completion_trigger called with text: {:?}",
+            text
+        );
+
+        // Trigger on ':' character in org-mode headlines
+        if text != ":" {
+            log::info!("Text is not ':', returning false");
+            return false;
+        }
+
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        let position_point = position.to_point(&buffer_snapshot);
+        let line_start = language::Point::new(position_point.row, 0);
+        let line_text = buffer_snapshot
+            .text_for_range(line_start..position_point)
+            .collect::<String>();
+
+        log::info!("Line text: {:?}", line_text);
+
+        // Check if we're on a headline (starts with *)
+        let trimmed = line_text.trim_start();
+        let is_headline = trimmed.starts_with('*');
+
+        log::info!("Is headline: {}", is_headline);
+        is_headline
+    }
+
+    fn sort_completions(&self) -> bool {
+        false
+    }
+
+    fn filter_completions(&self) -> bool {
+        false
     }
 }
 
