@@ -49,6 +49,14 @@ actions!(
         CycleFold,
         /// Cycles the TODO state of the current headline (TODO -> DOING -> DONE, etc.).
         CycleTodoState,
+        /// Schedules the current task with a date.
+        ScheduleTask,
+        /// Sets a deadline for the current task.
+        SetDeadline,
+        /// Decreases the date by one week in the date picker.
+        DatePickerPreviousWeek,
+        /// Increases the date by one week in the date picker.
+        DatePickerNextWeek,
     ]
 );
 
@@ -164,6 +172,12 @@ pub fn init(_: Arc<AppState>, cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &CycleTodoState, window, cx| {
                 cycle_todo_state(workspace, window, cx);
+            });
+            workspace.register_action(|workspace, _: &ScheduleTask, window, cx| {
+                schedule_task(workspace, window, cx);
+            });
+            workspace.register_action(|workspace, _: &SetDeadline, window, cx| {
+                set_deadline(workspace, window, cx);
             });
 
             // Observe active pane changes to automatically enable/disable zen mode
@@ -774,6 +788,243 @@ pub fn cycle_todo_state(
         singleton_buffer.update(cx, |buffer, cx| {
             buffer.edit([(edit_range, new_text)], None, cx);
         });
+    });
+}
+
+pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    log::info!("schedule_task called");
+    let Some(_editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        log::info!("No active editor found");
+        return;
+    };
+
+    // Default to tomorrow as initial date
+    let tomorrow = Local::now().naive_local().date() + chrono::Duration::days(1);
+    let workspace_weak = cx.entity().downgrade();
+
+    log::info!("Opening date picker modal");
+    workspace.toggle_modal(window, cx, |window, cx| {
+        DatePickerModal::new(
+            tomorrow,
+            move |selected_date, _window, cx| {
+                let Some(workspace) = workspace_weak.upgrade() else {
+                    return;
+                };
+
+                workspace.update(cx, |workspace, cx| {
+                    let Some(editor) = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                    else {
+                        return;
+                    };
+
+                    let weekday = selected_date.format("%a").to_string();
+                    let schedule_line = format!(
+                        "SCHEDULED: <{} {}>",
+                        selected_date.format("%Y-%m-%d"),
+                        weekday
+                    );
+
+                    editor.update(cx, |editor, cx| {
+                        let buffer = editor.buffer().read(cx);
+                        let Some(singleton_buffer) = buffer.as_singleton() else {
+                            return;
+                        };
+
+                        let buffer_snapshot = singleton_buffer.read(cx).snapshot();
+                        let cursor_position = editor.selections.newest_anchor().head();
+                        let buffer_anchor = cursor_position.text_anchor;
+                        let buffer_offset = buffer_anchor.to_offset(&buffer_snapshot);
+
+                        // Find the headline node
+                        let headline_node =
+                            buffer_snapshot.syntax_ancestor(buffer_offset..buffer_offset);
+                        let Some(mut headline_node) = headline_node else {
+                            return;
+                        };
+
+                        while headline_node.kind() != "headline" {
+                            if let Some(parent) = headline_node.parent() {
+                                headline_node = parent;
+                            } else {
+                                return;
+                            }
+                        }
+
+                        // Get the full buffer text to search for existing SCHEDULED
+                        let headline_end = headline_node.end_byte();
+                        let headline_start = headline_node.start_byte();
+                        let buffer_text = buffer_snapshot.text();
+
+                        // Find the line after the headline where we should look
+                        let text_after_headline = &buffer_text[headline_end..];
+                        let search_end = text_after_headline
+                            .find("\n*")
+                            .unwrap_or(text_after_headline.len());
+                        let section_text = &text_after_headline[..search_end];
+
+                        singleton_buffer.update(cx, |buffer, cx| {
+                            // Look for existing SCHEDULED line in the section
+                            if let Some(scheduled_pos) = section_text.find("SCHEDULED:") {
+                                // Find the entire line with SCHEDULED
+                                let abs_scheduled_start = headline_end + scheduled_pos;
+                                let before_scheduled = &section_text[..scheduled_pos];
+                                let after_scheduled = &section_text[scheduled_pos..];
+
+                                let line_start = before_scheduled
+                                    .rfind('\n')
+                                    .map(|pos| headline_end + pos)
+                                    .unwrap_or(headline_end);
+                                let line_end = after_scheduled
+                                    .find('\n')
+                                    .map(|pos| abs_scheduled_start + pos + 1)
+                                    .unwrap_or(headline_end + section_text.len());
+
+                                // Replace the entire line, ensuring proper newlines
+                                buffer.edit(
+                                    [(line_start..line_end, format!("\n{}\n", schedule_line))],
+                                    None,
+                                    cx,
+                                );
+                            } else {
+                                // Insert new SCHEDULED line after the headline with trailing newline
+                                buffer.edit(
+                                    [(
+                                        headline_end..headline_end,
+                                        format!("\n{}\n", schedule_line),
+                                    )],
+                                    None,
+                                    cx,
+                                );
+                            }
+                        });
+                    });
+                });
+            },
+            window,
+            cx,
+        )
+    });
+}
+
+pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(_editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        return;
+    };
+
+    // Default to 7 days from now as initial date
+    let deadline_date = Local::now().naive_local().date() + chrono::Duration::days(7);
+    let workspace_weak = cx.entity().downgrade();
+
+    workspace.toggle_modal(window, cx, |window, cx| {
+        DatePickerModal::new(
+            deadline_date,
+            move |selected_date, _window, cx| {
+                let Some(workspace) = workspace_weak.upgrade() else {
+                    return;
+                };
+
+                workspace.update(cx, |workspace, cx| {
+                    let Some(editor) = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                    else {
+                        return;
+                    };
+
+                    let weekday = selected_date.format("%a").to_string();
+                    let deadline_line = format!(
+                        "DEADLINE: <{} {}>",
+                        selected_date.format("%Y-%m-%d"),
+                        weekday
+                    );
+
+                    editor.update(cx, |editor, cx| {
+                        let buffer = editor.buffer().read(cx);
+                        let Some(singleton_buffer) = buffer.as_singleton() else {
+                            return;
+                        };
+
+                        let buffer_snapshot = singleton_buffer.read(cx).snapshot();
+                        let cursor_position = editor.selections.newest_anchor().head();
+                        let buffer_anchor = cursor_position.text_anchor;
+                        let buffer_offset = buffer_anchor.to_offset(&buffer_snapshot);
+
+                        // Find the headline node
+                        let headline_node =
+                            buffer_snapshot.syntax_ancestor(buffer_offset..buffer_offset);
+                        let Some(mut headline_node) = headline_node else {
+                            return;
+                        };
+
+                        while headline_node.kind() != "headline" {
+                            if let Some(parent) = headline_node.parent() {
+                                headline_node = parent;
+                            } else {
+                                return;
+                            }
+                        }
+
+                        // Get the full buffer text to search for existing DEADLINE
+                        let headline_end = headline_node.end_byte();
+                        let headline_start = headline_node.start_byte();
+                        let buffer_text = buffer_snapshot.text();
+
+                        // Find the line after the headline where we should look
+                        let text_after_headline = &buffer_text[headline_end..];
+                        let search_end = text_after_headline
+                            .find("\n*")
+                            .unwrap_or(text_after_headline.len());
+                        let section_text = &text_after_headline[..search_end];
+
+                        singleton_buffer.update(cx, |buffer, cx| {
+                            // Look for existing DEADLINE line in the section
+                            if let Some(deadline_pos) = section_text.find("DEADLINE:") {
+                                // Find the entire line with DEADLINE
+                                let abs_deadline_start = headline_end + deadline_pos;
+                                let before_deadline = &section_text[..deadline_pos];
+                                let after_deadline = &section_text[deadline_pos..];
+
+                                let line_start = before_deadline
+                                    .rfind('\n')
+                                    .map(|pos| headline_end + pos)
+                                    .unwrap_or(headline_end);
+                                let line_end = after_deadline
+                                    .find('\n')
+                                    .map(|pos| abs_deadline_start + pos + 1)
+                                    .unwrap_or(headline_end + section_text.len());
+
+                                // Replace the entire line, ensuring proper newlines
+                                buffer.edit(
+                                    [(line_start..line_end, format!("\n{}\n", deadline_line))],
+                                    None,
+                                    cx,
+                                );
+                            } else {
+                                // Insert new DEADLINE line after the headline with trailing newline
+                                buffer.edit(
+                                    [(
+                                        headline_end..headline_end,
+                                        format!("\n{}\n", deadline_line),
+                                    )],
+                                    None,
+                                    cx,
+                                );
+                            }
+                        });
+                    });
+                });
+            },
+            window,
+            cx,
+        )
     });
 }
 
@@ -2293,6 +2544,137 @@ impl PickerDelegate for TagPickerDelegate {
         )
     }
 }
+
+// Date picker modal for scheduling and deadlines
+pub struct DatePickerModal {
+    selected_date: chrono::NaiveDate,
+    on_confirm: Option<Box<dyn FnOnce(chrono::NaiveDate, &mut Window, &mut App)>>,
+    focus_handle: FocusHandle,
+}
+
+impl DatePickerModal {
+    pub fn new(
+        initial_date: chrono::NaiveDate,
+        on_confirm: impl FnOnce(chrono::NaiveDate, &mut Window, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+
+        Self {
+            selected_date: initial_date,
+            on_confirm: Some(Box::new(on_confirm)),
+            focus_handle,
+        }
+    }
+
+    fn adjust_date(&mut self, days: i64, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(new_date) = self
+            .selected_date
+            .checked_add_signed(chrono::Duration::days(days))
+        {
+            self.selected_date = new_date;
+            cx.notify();
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(on_confirm) = self.on_confirm.take() {
+            on_confirm(self.selected_date, window, cx);
+            cx.emit(DismissEvent);
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn next_day(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_date(1, window, cx);
+    }
+
+    fn prev_day(&mut self, _: &menu::SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_date(-1, window, cx);
+    }
+
+    fn next_week(&mut self, _: &DatePickerNextWeek, window: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_date(7, window, cx);
+    }
+
+    fn prev_week(
+        &mut self,
+        _: &DatePickerPreviousWeek,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_date(-7, window, cx);
+    }
+}
+
+impl Render for DatePickerModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let weekday = self.selected_date.format("%A").to_string();
+        let formatted_date = self.selected_date.format("%Y-%m-%d").to_string();
+
+        v_flex()
+            .key_context("DatePickerModal")
+            .track_focus(&self.focus_handle)
+            .w(rems(34.))
+            .elevation_2(cx)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::prev_day))
+            .on_action(cx.listener(Self::next_day))
+            .on_action(cx.listener(Self::prev_week))
+            .on_action(cx.listener(Self::next_week))
+            .p_4()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_center()
+                    .child(Label::new("Select Date").size(LabelSize::Large)),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .justify_center()
+                            .gap_2()
+                            .child(Label::new(weekday).size(LabelSize::Default)),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_center()
+                            .gap_2()
+                            .child(Label::new(formatted_date).size(LabelSize::Large)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .justify_center()
+                    .gap_2()
+                    .mt_4()
+                    .child(Label::new("Use ↑/↓ for ±1 day, ←/→ for ±7 days")),
+            )
+            .child(
+                h_flex()
+                    .justify_center()
+                    .gap_2()
+                    .child(Label::new("Press Enter to confirm, Esc to cancel")),
+            )
+    }
+}
+
+impl Focusable for DatePickerModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for DatePickerModal {}
+impl ModalView for DatePickerModal {}
 
 // Tag completion provider for org-mode files
 pub struct TagCompletionProvider {}
