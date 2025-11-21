@@ -3445,17 +3445,56 @@ fn open_agenda_item(
     cx: &mut Context<Workspace>,
 ) {
     let path = item.file_path.clone();
-    // TODO: Navigate to line item.line_number - for now just opens file
+    let line_number = item.line_number;
 
-    workspace
-        .open_paths(
-            vec![path],
-            workspace::OpenOptions::default(),
-            None,
-            window,
-            cx,
-        )
-        .detach();
+    let task = workspace.open_paths(
+        vec![path],
+        workspace::OpenOptions::default(),
+        None,
+        window,
+        cx,
+    );
+
+    let workspace_weak = cx.entity().downgrade();
+    cx.spawn_in(window, async move |_, cx| {
+        // Wait for the file to open
+        let items = task.await;
+
+        // Get the first item (our opened file)
+        if let Some(Some(Ok(item_handle))) = items.into_iter().next() {
+            // Try to downcast to Editor
+            if let Ok(editor) = item_handle.to_any().downcast::<Editor>() {
+                // Navigate to the line using workspace context
+                workspace_weak
+                    .update_in(cx, |_, window, cx| {
+                        // Convert line number (1-indexed) to Point (0-indexed row)
+                        let row = line_number.saturating_sub(1);
+                        let point = language::Point::new(row, 0);
+
+                        editor.update(cx, |editor, cx| {
+                            // Get the buffer and convert point to anchor
+                            let buffer = editor.buffer().read(cx);
+                            let snapshot = buffer.snapshot(cx);
+
+                            // anchor_at returns an Anchor directly, not an Option
+                            let anchor = snapshot.anchor_at(point, language::Bias::Left);
+
+                            // Change selection and scroll to center
+                            editor.change_selections(
+                                editor::SelectionEffects::scroll(
+                                    editor::scroll::Autoscroll::center(),
+                                ),
+                                window,
+                                cx,
+                                |s| s.select_ranges(Some(anchor..anchor)),
+                            );
+                        });
+                    })
+                    .ok();
+            }
+        }
+    })
+    .detach();
 }
 
 // Agenda tag filter picker
