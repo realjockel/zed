@@ -73,6 +73,8 @@ actions!(
         AgendaPickTagFilter,
         /// Opens a picker to select a file filter with fuzzy search.
         AgendaPickFileFilter,
+        /// Opens a picker to select a date range filter.
+        AgendaPickDateRange,
     ]
 );
 
@@ -2734,7 +2736,7 @@ pub struct AgendaView {
     selected_index: usize,
     workspace: WeakEntity<Workspace>,
     show_done: bool,
-    filter_tag: Option<String>,
+    filter_tags: Vec<String>, // Changed from Option<String> to Vec<String> for multi-tag support
     filter_file: Option<String>,
     available_tags: Vec<String>,
     available_files: Vec<String>,
@@ -2752,7 +2754,7 @@ impl AgendaView {
             selected_index: 0,
             workspace,
             show_done: false,
-            filter_tag: None,
+            filter_tags: Vec::new(),
             filter_file: None,
             available_tags: Vec::new(),
             available_files: Vec::new(),
@@ -2795,20 +2797,27 @@ impl AgendaView {
             return;
         }
 
-        self.filter_tag = match &self.filter_tag {
-            None => Some(self.available_tags[0].clone()),
-            Some(current) => {
-                if let Some(idx) = self.available_tags.iter().position(|t| t == current) {
-                    if idx + 1 < self.available_tags.len() {
-                        Some(self.available_tags[idx + 1].clone())
-                    } else {
-                        None // Cycle back to "All"
+        // Cycle to the next tag: if no tags selected, add first tag
+        // If tags selected, find the last one and add the next, or clear if at end
+        if self.filter_tags.is_empty() {
+            self.filter_tags.push(self.available_tags[0].clone());
+        } else {
+            let last_tag = self.filter_tags.last().unwrap();
+            if let Some(idx) = self.available_tags.iter().position(|t| t == last_tag) {
+                if idx + 1 < self.available_tags.len() {
+                    // Add next tag
+                    let next_tag = self.available_tags[idx + 1].clone();
+                    if !self.filter_tags.contains(&next_tag) {
+                        self.filter_tags.push(next_tag);
                     }
                 } else {
-                    None
+                    // Reached the end, clear all
+                    self.filter_tags.clear();
                 }
+            } else {
+                self.filter_tags.clear();
             }
-        };
+        }
 
         self.apply_filters();
         cx.notify();
@@ -2849,7 +2858,7 @@ impl AgendaView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.filter_tag = None;
+        self.filter_tags.clear();
         self.filter_file = None;
         self.show_done = false;
         self.days_range = 30;
@@ -2871,6 +2880,8 @@ impl AgendaView {
                 workspace.toggle_modal(window, cx, |window, cx| {
                     let delegate = AgendaTagPickerDelegate::new(tags, view_handle);
                     Picker::uniform_list(delegate, window, cx)
+                        .width(rems(20.))
+                        .max_height(Some(rems(20.).into()))
                 });
             });
         }
@@ -2890,6 +2901,28 @@ impl AgendaView {
                 workspace.toggle_modal(window, cx, |window, cx| {
                     let delegate = AgendaFilePickerDelegate::new(files, view_handle);
                     Picker::uniform_list(delegate, window, cx)
+                        .width(rems(20.))
+                        .max_height(Some(rems(20.).into()))
+                });
+            });
+        }
+    }
+
+    fn pick_date_range(
+        &mut self,
+        _: &AgendaPickDateRange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let view_handle = cx.entity().downgrade();
+
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    let delegate = AgendaDateRangePickerDelegate::new(view_handle);
+                    Picker::uniform_list(delegate, window, cx)
+                        .width(rems(25.))
+                        .max_height(Some(rems(20.).into()))
                 });
             });
         }
@@ -2920,9 +2953,9 @@ impl AgendaView {
                 }
             }
 
-            // Filter by tag
-            if let Some(ref filter_tag) = self.filter_tag {
-                if !item.tags.contains(filter_tag) {
+            // Filter by tags (item must have at least one of the selected tags)
+            if !self.filter_tags.is_empty() {
+                if !self.filter_tags.iter().any(|tag| item.tags.contains(tag)) {
                     return false;
                 }
             }
@@ -3063,6 +3096,7 @@ impl Render for AgendaView {
             .on_action(cx.listener(Self::clear_filters))
             .on_action(cx.listener(Self::pick_tag_filter))
             .on_action(cx.listener(Self::pick_file_filter))
+            .on_action(cx.listener(Self::pick_date_range))
             .child(
                 v_flex()
                     .border_b_1()
@@ -3096,12 +3130,12 @@ impl Render for AgendaView {
                                     Color::Muted
                                 }),
                             )
-                            .when_some(self.filter_tag.as_ref(), |this, tag| {
-                                this.child(
+                            .when(!self.filter_tags.is_empty(), |this| {
+                                this.children(self.filter_tags.iter().map(|tag| {
                                     Label::new(format!("• Tag: {}", tag))
                                         .size(LabelSize::XSmall)
-                                        .color(Color::Accent),
-                                )
+                                        .color(Color::Accent)
+                                }))
                             })
                             .when_some(self.filter_file.as_ref(), |this, file| {
                                 this.child(
@@ -3428,6 +3462,7 @@ fn open_agenda_item(
 pub struct AgendaTagPickerDelegate {
     tags: Vec<String>,
     matches: Vec<StringMatch>,
+    selected_index: usize,
     agenda_view: WeakEntity<AgendaView>,
 }
 
@@ -3448,6 +3483,7 @@ impl AgendaTagPickerDelegate {
                     score: 0.0,
                 })
                 .collect(),
+            selected_index: 0,
             agenda_view,
         }
     }
@@ -3461,15 +3497,16 @@ impl PickerDelegate for AgendaTagPickerDelegate {
     }
 
     fn selected_index(&self) -> usize {
-        0
+        self.selected_index
     }
 
     fn set_selected_index(
         &mut self,
-        _ix: usize,
+        ix: usize,
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) {
+        self.selected_index = ix;
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -3519,7 +3556,11 @@ impl PickerDelegate for AgendaTagPickerDelegate {
             };
 
             this.update(cx, |this, cx| {
-                this.delegate.matches = matches;
+                let delegate = &mut this.delegate;
+                delegate.matches = matches;
+                delegate.selected_index = delegate
+                    .selected_index
+                    .min(delegate.matches.len().saturating_sub(1));
                 cx.notify();
             })
             .log_err();
@@ -3527,15 +3568,20 @@ impl PickerDelegate for AgendaTagPickerDelegate {
     }
 
     fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        if let Some(mat) = self.matches.first() {
+        if let Some(mat) = self.matches.get(self.selected_index) {
             let tag = &self.tags[mat.candidate_id];
 
             if let Some(agenda_view) = self.agenda_view.upgrade() {
                 agenda_view.update(cx, |view, cx| {
                     if tag == "All (clear filter)" {
-                        view.filter_tag = None;
+                        view.filter_tags.clear();
                     } else {
-                        view.filter_tag = Some(tag.clone());
+                        // Toggle tag: add if not present, remove if present
+                        if let Some(pos) = view.filter_tags.iter().position(|t| t == tag) {
+                            view.filter_tags.remove(pos);
+                        } else {
+                            view.filter_tags.push(tag.clone());
+                        }
                     }
                     view.apply_filters();
                     cx.notify();
@@ -3555,14 +3601,16 @@ impl PickerDelegate for AgendaTagPickerDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let mat = self.matches.get(ix)?;
-        let tag = &self.tags[mat.candidate_id];
 
         Some(
             ui::ListItem::new(ix)
                 .inset(true)
                 .spacing(ui::ListItemSpacing::Sparse)
                 .toggle_state(selected)
-                .child(ui::Label::new(tag.clone())),
+                .child(ui::HighlightedLabel::new(
+                    mat.string.clone(),
+                    mat.positions.clone(),
+                )),
         )
     }
 }
@@ -3571,6 +3619,7 @@ impl PickerDelegate for AgendaTagPickerDelegate {
 pub struct AgendaFilePickerDelegate {
     files: Vec<String>,
     matches: Vec<StringMatch>,
+    selected_index: usize,
     agenda_view: WeakEntity<AgendaView>,
 }
 
@@ -3591,6 +3640,7 @@ impl AgendaFilePickerDelegate {
                     score: 0.0,
                 })
                 .collect(),
+            selected_index: 0,
             agenda_view,
         }
     }
@@ -3604,15 +3654,16 @@ impl PickerDelegate for AgendaFilePickerDelegate {
     }
 
     fn selected_index(&self) -> usize {
-        0
+        self.selected_index
     }
 
     fn set_selected_index(
         &mut self,
-        _ix: usize,
+        ix: usize,
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) {
+        self.selected_index = ix;
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -3662,7 +3713,11 @@ impl PickerDelegate for AgendaFilePickerDelegate {
             };
 
             this.update(cx, |this, cx| {
-                this.delegate.matches = matches;
+                let delegate = &mut this.delegate;
+                delegate.matches = matches;
+                delegate.selected_index = delegate
+                    .selected_index
+                    .min(delegate.matches.len().saturating_sub(1));
                 cx.notify();
             })
             .log_err();
@@ -3670,7 +3725,7 @@ impl PickerDelegate for AgendaFilePickerDelegate {
     }
 
     fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        if let Some(mat) = self.matches.first() {
+        if let Some(mat) = self.matches.get(self.selected_index) {
             let file = &self.files[mat.candidate_id];
 
             if let Some(agenda_view) = self.agenda_view.upgrade() {
@@ -3698,14 +3753,173 @@ impl PickerDelegate for AgendaFilePickerDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let mat = self.matches.get(ix)?;
-        let file = &self.files[mat.candidate_id];
 
         Some(
             ui::ListItem::new(ix)
                 .inset(true)
                 .spacing(ui::ListItemSpacing::Sparse)
                 .toggle_state(selected)
-                .child(ui::Label::new(file.clone())),
+                .child(ui::HighlightedLabel::new(
+                    mat.string.clone(),
+                    mat.positions.clone(),
+                )),
+        )
+    }
+}
+
+// Agenda date range filter picker
+pub struct AgendaDateRangePickerDelegate {
+    ranges: Vec<(String, i64)>, // (label, days)
+    matches: Vec<StringMatch>,
+    selected_index: usize,
+    agenda_view: WeakEntity<AgendaView>,
+}
+
+impl AgendaDateRangePickerDelegate {
+    fn new(agenda_view: WeakEntity<AgendaView>) -> Self {
+        let ranges = vec![
+            ("All time".to_string(), 0),
+            ("Today".to_string(), 0),
+            ("Next 3 days".to_string(), 3),
+            ("This week (7 days)".to_string(), 7),
+            ("Next 2 weeks (14 days)".to_string(), 14),
+            ("This month (30 days)".to_string(), 30),
+            ("Next 2 months (60 days)".to_string(), 60),
+            ("This quarter (90 days)".to_string(), 90),
+            ("This year (365 days)".to_string(), 365),
+        ];
+
+        Self {
+            ranges: ranges.clone(),
+            matches: ranges
+                .iter()
+                .enumerate()
+                .map(|(index, (label, _))| StringMatch {
+                    candidate_id: index,
+                    string: label.clone(),
+                    positions: Vec::new(),
+                    score: 0.0,
+                })
+                .collect(),
+            selected_index: 0,
+            agenda_view,
+        }
+    }
+}
+
+impl PickerDelegate for AgendaDateRangePickerDelegate {
+    type ListItem = ui::ListItem;
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Select date range...".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> gpui::Task<()> {
+        let candidates = self
+            .ranges
+            .iter()
+            .enumerate()
+            .map(|(id, (label, _))| StringMatchCandidate {
+                id,
+                string: label.clone(),
+                char_bag: label.chars().collect(),
+            })
+            .collect::<Vec<_>>();
+
+        let background_executor = cx.background_executor().clone();
+        cx.spawn_in(_window, async move |this, cx| {
+            let matches = if query.is_empty() {
+                candidates
+                    .into_iter()
+                    .map(|candidate| StringMatch {
+                        candidate_id: candidate.id,
+                        string: candidate.string,
+                        positions: Vec::new(),
+                        score: 0.0,
+                    })
+                    .collect()
+            } else {
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    false,
+                    usize::MAX,
+                    &Default::default(),
+                    background_executor,
+                )
+                .await
+            };
+
+            this.update(cx, |this, cx| {
+                let delegate = &mut this.delegate;
+                delegate.matches = matches;
+                delegate.selected_index = delegate
+                    .selected_index
+                    .min(delegate.matches.len().saturating_sub(1));
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(mat) = self.matches.get(self.selected_index) {
+            let (_, days) = &self.ranges[mat.candidate_id];
+
+            if let Some(agenda_view) = self.agenda_view.upgrade() {
+                agenda_view.update(cx, |view, cx| {
+                    view.days_range = *days;
+                    view.apply_filters();
+                    cx.notify();
+                });
+            }
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let mat = self.matches.get(ix)?;
+
+        Some(
+            ui::ListItem::new(ix)
+                .inset(true)
+                .spacing(ui::ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(ui::HighlightedLabel::new(
+                    mat.string.clone(),
+                    mat.positions.clone(),
+                )),
         )
     }
 }
