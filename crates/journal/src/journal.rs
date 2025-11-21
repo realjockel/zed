@@ -4,8 +4,8 @@ use editor::{self, Editor, SelectionEffects, ToPoint};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, Global, IntoElement, ParentElement, Render, Styled, Subscription, WeakEntity,
-    Window, actions,
+    Focusable, Global, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
+    WeakEntity, Window, actions,
 };
 use language::ToOffset as _;
 use language::{Point, ToPoint as _};
@@ -28,7 +28,7 @@ use ui::{HighlightedLabel, Label, LabelSize, ListItem, ListItemSpacing, prelude:
 use util::ResultExt;
 use util::paths::PathStyle;
 use util::rel_path::RelPathBuf;
-use workspace::{AppState, ModalView, OpenVisible, Workspace};
+use workspace::{AppState, ModalView, OpenVisible, Workspace, item::ItemEvent};
 
 actions!(
     journal,
@@ -57,6 +57,22 @@ actions!(
         DatePickerPreviousWeek,
         /// Increases the date by one week in the date picker.
         DatePickerNextWeek,
+        /// Opens the agenda view showing scheduled and deadline tasks.
+        OpenAgenda,
+        /// Toggles showing completed (DONE/CLOSED) items in agenda.
+        AgendaToggleDone,
+        /// Cycles through date range filters (Week/Month/Quarter/All).
+        AgendaCycleDateRange,
+        /// Cycles through tag filters (All/specific tags).
+        AgendaCycleTagFilter,
+        /// Cycles through file filters (All/specific files).
+        AgendaCycleFileFilter,
+        /// Clears all agenda filters.
+        AgendaClearFilters,
+        /// Opens a picker to select a tag filter with fuzzy search.
+        AgendaPickTagFilter,
+        /// Opens a picker to select a file filter with fuzzy search.
+        AgendaPickFileFilter,
     ]
 );
 
@@ -178,6 +194,9 @@ pub fn init(_: Arc<AppState>, cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &SetDeadline, window, cx| {
                 set_deadline(workspace, window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenAgenda, window, cx| {
+                open_agenda(workspace, window, cx);
             });
 
             // Observe active pane changes to automatically enable/disable zen mode
@@ -857,7 +876,7 @@ pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
 
                         // Get the full buffer text to search for existing SCHEDULED
                         let headline_end = headline_node.end_byte();
-                        let headline_start = headline_node.start_byte();
+                        let _headline_start = headline_node.start_byte();
                         let buffer_text = buffer_snapshot.text();
 
                         // Find the line after the headline where we should look
@@ -974,7 +993,7 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
 
                         // Get the full buffer text to search for existing DEADLINE
                         let headline_end = headline_node.end_byte();
-                        let headline_start = headline_node.start_byte();
+                        let _headline_start = headline_node.start_byte();
                         let buffer_text = buffer_snapshot.text();
 
                         // Find the line after the headline where we should look
@@ -1026,6 +1045,19 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
             cx,
         )
     });
+}
+
+pub fn open_agenda(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let workspace_weak = cx.entity().downgrade();
+
+    let agenda_view = cx.new(|cx| AgendaView::new(workspace_weak.clone(), cx));
+
+    // Collect items immediately
+    agenda_view.update(cx, |view, cx| {
+        view.collect_agenda_items(cx);
+    });
+
+    workspace.add_item_to_active_pane(Box::new(agenda_view), None, true, window, cx);
 }
 
 pub fn capture_template(
@@ -2675,6 +2707,1008 @@ impl Focusable for DatePickerModal {
 
 impl EventEmitter<DismissEvent> for DatePickerModal {}
 impl ModalView for DatePickerModal {}
+
+// Agenda view for scheduled and deadline tasks
+#[derive(Debug, Clone)]
+pub struct AgendaItem {
+    pub file_path: PathBuf,
+    pub headline: String,
+    pub date: chrono::NaiveDate,
+    pub entry_type: AgendaEntryType,
+    pub line_number: u32,
+    pub tags: Vec<String>,
+    pub todo_keyword: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgendaEntryType {
+    Scheduled,
+    Deadline,
+    Closed,
+}
+
+pub struct AgendaView {
+    focus_handle: FocusHandle,
+    items: Vec<AgendaItem>,
+    all_items: Vec<AgendaItem>, // Unfiltered items
+    selected_index: usize,
+    workspace: WeakEntity<Workspace>,
+    show_done: bool,
+    filter_tag: Option<String>,
+    filter_file: Option<String>,
+    available_tags: Vec<String>,
+    available_files: Vec<String>,
+    days_range: i64, // Number of days to show (0 = all, 7 = week, 30 = month)
+}
+
+impl AgendaView {
+    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+
+        Self {
+            focus_handle,
+            items: Vec::new(),
+            all_items: Vec::new(),
+            selected_index: 0,
+            workspace,
+            show_done: false,
+            filter_tag: None,
+            filter_file: None,
+            available_tags: Vec::new(),
+            available_files: Vec::new(),
+            days_range: 30, // Default to 30 days
+        }
+    }
+
+    fn toggle_show_done(
+        &mut self,
+        _: &AgendaToggleDone,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_done = !self.show_done;
+        self.collect_agenda_items(cx);
+    }
+
+    fn cycle_date_range(
+        &mut self,
+        _: &AgendaCycleDateRange,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.days_range = match self.days_range {
+            7 => 30,
+            30 => 90,
+            90 => 0,
+            _ => 7,
+        };
+        self.collect_agenda_items(cx);
+    }
+
+    fn cycle_tag_filter(
+        &mut self,
+        _: &AgendaCycleTagFilter,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.available_tags.is_empty() {
+            return;
+        }
+
+        self.filter_tag = match &self.filter_tag {
+            None => Some(self.available_tags[0].clone()),
+            Some(current) => {
+                if let Some(idx) = self.available_tags.iter().position(|t| t == current) {
+                    if idx + 1 < self.available_tags.len() {
+                        Some(self.available_tags[idx + 1].clone())
+                    } else {
+                        None // Cycle back to "All"
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        self.apply_filters();
+        cx.notify();
+    }
+
+    fn cycle_file_filter(
+        &mut self,
+        _: &AgendaCycleFileFilter,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.available_files.is_empty() {
+            return;
+        }
+
+        self.filter_file = match &self.filter_file {
+            None => Some(self.available_files[0].clone()),
+            Some(current) => {
+                if let Some(idx) = self.available_files.iter().position(|f| f == current) {
+                    if idx + 1 < self.available_files.len() {
+                        Some(self.available_files[idx + 1].clone())
+                    } else {
+                        None // Cycle back to "All"
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        self.apply_filters();
+        cx.notify();
+    }
+
+    fn clear_filters(
+        &mut self,
+        _: &AgendaClearFilters,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filter_tag = None;
+        self.filter_file = None;
+        self.show_done = false;
+        self.days_range = 30;
+        self.apply_filters();
+        cx.notify();
+    }
+
+    fn pick_tag_filter(
+        &mut self,
+        _: &AgendaPickTagFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let tags = self.available_tags.clone();
+            let view_handle = cx.entity().downgrade();
+
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    let delegate = AgendaTagPickerDelegate::new(tags, view_handle);
+                    Picker::uniform_list(delegate, window, cx)
+                });
+            });
+        }
+    }
+
+    fn pick_file_filter(
+        &mut self,
+        _: &AgendaPickFileFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let files = self.available_files.clone();
+            let view_handle = cx.entity().downgrade();
+
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    let delegate = AgendaFilePickerDelegate::new(files, view_handle);
+                    Picker::uniform_list(delegate, window, cx)
+                });
+            });
+        }
+    }
+
+    fn apply_filters(&mut self) {
+        let today = Local::now().naive_local().date();
+        let mut filtered = self.all_items.clone();
+
+        filtered.retain(|item| {
+            // Filter by TODO state
+            if !self.show_done {
+                if let Some(todo) = &item.todo_keyword {
+                    if todo == "DONE" {
+                        return false;
+                    }
+                }
+                if item.entry_type == AgendaEntryType::Closed {
+                    return false;
+                }
+            }
+
+            // Filter by date range
+            if self.days_range > 0 {
+                let days_diff = (item.date - today).num_days().abs();
+                if days_diff > self.days_range {
+                    return false;
+                }
+            }
+
+            // Filter by tag
+            if let Some(ref filter_tag) = self.filter_tag {
+                if !item.tags.contains(filter_tag) {
+                    return false;
+                }
+            }
+
+            // Filter by file
+            if let Some(ref filter_file) = self.filter_file {
+                let file_name = item
+                    .file_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if file_name != filter_file {
+                    return false;
+                }
+            }
+
+            true
+        });
+
+        filtered.sort_by(|a, b| a.date.cmp(&b.date));
+        self.items = filtered;
+        self.selected_index = 0;
+    }
+
+    fn collect_agenda_items(&mut self, cx: &mut Context<Self>) {
+        let settings = JournalSettings::get_global(cx);
+        let Some(journal_dir) = journal_dir(&settings.path) else {
+            log::warn!("Could not determine journal directory for agenda");
+            return;
+        };
+
+        let mut items = Vec::new();
+
+        fn scan_org_files(dir: &std::path::Path, items: &mut Vec<AgendaItem>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan_org_files(&path, items);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("org") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            extract_agenda_items(&path, &content, items);
+                        }
+                    }
+                }
+            }
+        }
+
+        scan_org_files(&journal_dir, &mut items);
+
+        // Extract unique tags and files for filtering
+        use std::collections::HashSet;
+        let mut tags_set: HashSet<String> = HashSet::new();
+        let mut files_set: HashSet<String> = HashSet::new();
+
+        for item in &items {
+            for tag in &item.tags {
+                tags_set.insert(tag.clone());
+            }
+            if let Some(file_name) = item.file_path.file_stem().and_then(|s| s.to_str()) {
+                files_set.insert(file_name.to_string());
+            }
+        }
+
+        self.available_tags = tags_set.into_iter().collect();
+        self.available_tags.sort();
+
+        self.available_files = files_set.into_iter().collect();
+        self.available_files.sort();
+
+        // Store all items before filtering
+        items.sort_by(|a, b| a.date.cmp(&b.date));
+        self.all_items = items;
+
+        // Apply current filters
+        self.apply_filters();
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_index + 1 < self.items.len() {
+            self.selected_index += 1;
+            cx.notify();
+        }
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+            cx.notify();
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = self.items.get(self.selected_index) {
+            let item = item.clone();
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    open_agenda_item(workspace, &item, window, cx);
+                });
+            }
+        }
+    }
+
+    fn refresh(&mut self, _: &menu::Restart, _window: &mut Window, cx: &mut Context<Self>) {
+        self.collect_agenda_items(cx);
+    }
+}
+
+impl Render for AgendaView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let today = Local::now().naive_local().date();
+
+        let range_label = match self.days_range {
+            7 => "Week",
+            30 => "Month",
+            90 => "Quarter",
+            _ => "All",
+        };
+
+        v_flex()
+            .key_context("AgendaView")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::refresh))
+            .on_action(cx.listener(Self::toggle_show_done))
+            .on_action(cx.listener(Self::cycle_date_range))
+            .on_action(cx.listener(Self::cycle_tag_filter))
+            .on_action(cx.listener(Self::cycle_file_filter))
+            .on_action(cx.listener(Self::clear_filters))
+            .on_action(cx.listener(Self::pick_tag_filter))
+            .on_action(cx.listener(Self::pick_file_filter))
+            .child(
+                v_flex()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        h_flex()
+                            .p_4()
+                            .pb_2()
+                            .child(Label::new("Agenda").size(LabelSize::Large)),
+                    )
+                    .child(
+                        h_flex()
+                            .px_4()
+                            .pb_3()
+                            .gap_2()
+                            .child(
+                                Label::new(format!("Range: {}", range_label))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(if self.show_done {
+                                    "• Showing Done"
+                                } else {
+                                    "• Hiding Done"
+                                })
+                                .size(LabelSize::XSmall)
+                                .color(if self.show_done {
+                                    Color::Success
+                                } else {
+                                    Color::Muted
+                                }),
+                            )
+                            .when_some(self.filter_tag.as_ref(), |this, tag| {
+                                this.child(
+                                    Label::new(format!("• Tag: {}", tag))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            })
+                            .when_some(self.filter_file.as_ref(), |this, file| {
+                                this.child(
+                                    Label::new(format!("• File: {}", file))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            })
+                            .child(
+                                Label::new(format!("{} items", self.items.len()))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+            )
+            .children(self.render_items(today, cx))
+    }
+}
+
+impl AgendaView {
+    fn render_items(&self, today: chrono::NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut elements = Vec::new();
+        let mut current_date: Option<chrono::NaiveDate> = None;
+
+        for (idx, item) in self.items.iter().enumerate() {
+            // Add date header if date changed
+            if current_date != Some(item.date) {
+                current_date = Some(item.date);
+
+                let date_label = if item.date == today {
+                    "Today".to_string()
+                } else if item.date == today + chrono::Duration::days(1) {
+                    "Tomorrow".to_string()
+                } else if item.date == today - chrono::Duration::days(1) {
+                    "Yesterday".to_string()
+                } else {
+                    item.date.format("%A, %B %d, %Y").to_string()
+                };
+
+                let days_diff = (item.date - today).num_days();
+                let date_color = if days_diff < 0 {
+                    Color::Error // Past dates
+                } else if days_diff == 0 {
+                    Color::Accent // Today
+                } else if days_diff <= 7 {
+                    Color::Warning // Within a week
+                } else {
+                    Color::Default
+                };
+
+                elements.push(
+                    h_flex()
+                        .p_2()
+                        .px_4()
+                        .mt_2()
+                        .child(
+                            Label::new(date_label)
+                                .color(date_color)
+                                .size(LabelSize::Default),
+                        )
+                        .into_any_element(),
+                );
+            }
+
+            // Render the item
+            let selected = idx == self.selected_index;
+            let item_bg = if selected {
+                cx.theme().colors().element_selected
+            } else {
+                cx.theme().colors().element_background
+            };
+
+            let entry_icon = match item.entry_type {
+                AgendaEntryType::Scheduled => "◷", // Clock icon
+                AgendaEntryType::Deadline => "⚠",  // Warning icon
+                AgendaEntryType::Closed => "✓",    // Check icon
+            };
+
+            let entry_color = match item.entry_type {
+                AgendaEntryType::Scheduled => Color::Accent,
+                AgendaEntryType::Deadline => Color::Warning,
+                AgendaEntryType::Closed => Color::Success,
+            };
+
+            elements.push(
+                h_flex()
+                    .w_full()
+                    .px_4()
+                    .py_2()
+                    .bg(item_bg)
+                    .when(selected, |this| {
+                        this.border_l_2()
+                            .border_color(cx.theme().colors().border_focused)
+                    })
+                    .gap_3()
+                    .child(
+                        h_flex().flex_none().w_6().justify_center().child(
+                            Label::new(entry_icon)
+                                .color(entry_color)
+                                .size(LabelSize::Default),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .gap_2()
+                            .items_center()
+                            .when_some(item.todo_keyword.as_ref(), |this, keyword| {
+                                let todo_color = match keyword.as_str() {
+                                    "TODO" | "DOING" | "NEXT" | "STARTED" => Color::Warning,
+                                    "DONE" => Color::Success,
+                                    "WAITING" | "DEFERRED" => Color::Muted,
+                                    "CANCELLED" | "CANCELED" => Color::Error,
+                                    _ => Color::Default,
+                                };
+                                this.child(
+                                    h_flex()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(cx.theme().colors().element_hover)
+                                        .child(
+                                            Label::new(keyword.clone())
+                                                .color(todo_color)
+                                                .size(LabelSize::XSmall),
+                                        ),
+                                )
+                            })
+                            .child(Label::new(item.headline.clone()).size(LabelSize::Small))
+                            .children(item.tags.iter().map(|tag| {
+                                h_flex()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().colors().element_active)
+                                    .child(
+                                        Label::new(format!(":{tag}:"))
+                                            .color(Color::Accent)
+                                            .size(LabelSize::XSmall),
+                                    )
+                                    .into_any_element()
+                            })),
+                    )
+                    .child(
+                        h_flex().flex_none().child(
+                            Label::new(
+                                item.file_path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                            .color(Color::Muted)
+                            .size(LabelSize::XSmall),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        if elements.is_empty() {
+            elements.push(
+                v_flex()
+                    .p_4()
+                    .items_center()
+                    .child(Label::new("No scheduled or deadline tasks found").color(Color::Muted))
+                    .into_any_element(),
+            );
+        }
+
+        elements
+    }
+}
+
+impl Focusable for AgendaView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<ItemEvent> for AgendaView {}
+
+impl workspace::Item for AgendaView {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Agenda".into()
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        Some("agenda view")
+    }
+
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<workspace::WorkspaceId>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<Option<Entity<Self>>> {
+        let view = cx.new(|cx| Self::new(self.workspace.clone(), cx));
+        gpui::Task::ready(Some(view))
+    }
+
+    fn to_item_events(_event: &Self::Event, _f: impl FnMut(ItemEvent)) {}
+}
+
+fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut Vec<AgendaItem>) {
+    use regex::Regex;
+
+    // Regex to match SCHEDULED/DEADLINE/CLOSED with dates
+    let scheduled_re = Regex::new(r"SCHEDULED:\s*<(\d{4}-\d{2}-\d{2})").unwrap();
+    let deadline_re = Regex::new(r"DEADLINE:\s*<(\d{4}-\d{2}-\d{2})").unwrap();
+    let closed_re = Regex::new(r"CLOSED:\s*\[(\d{4}-\d{2}-\d{2})").unwrap();
+    let tag_re = Regex::new(r":([a-zA-Z0-9_@]+):").unwrap();
+    let todo_re =
+        Regex::new(r"^\*+\s+(TODO|DONE|DOING|WAITING|NEXT|STARTED|CANCELLED|CANCELED|DEFERRED)\s+")
+            .unwrap();
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut current_headline = String::new();
+    let mut current_tags: Vec<String> = Vec::new();
+    let mut current_todo: Option<String> = None;
+
+    for (line_num, line) in lines.iter().enumerate() {
+        // Check if this is a headline
+        if line.trim_start().starts_with('*') {
+            // Extract tags from headline (at the end)
+            current_tags.clear();
+            let mut headline_text = line.trim().to_string();
+
+            // Find and extract tags from the end of the headline
+            if let Some(tag_start) = headline_text.rfind(" :") {
+                let potential_tags = &headline_text[tag_start..];
+                if potential_tags
+                    .chars()
+                    .all(|c| c == ':' || c == ' ' || c.is_alphanumeric() || c == '_' || c == '@')
+                {
+                    for cap in tag_re.captures_iter(potential_tags) {
+                        current_tags.push(cap[1].to_string());
+                    }
+                    headline_text = headline_text[..tag_start].trim_end().to_string();
+                }
+            }
+
+            // Extract TODO keyword and remove it from headline
+            current_todo = None;
+            if let Some(caps) = todo_re.captures(&headline_text) {
+                current_todo = Some(caps[1].to_string());
+                headline_text = todo_re.replace(&headline_text, "").to_string();
+            }
+
+            // Remove leading stars and whitespace
+            headline_text = headline_text.trim_start_matches('*').trim().to_string();
+
+            current_headline = headline_text;
+        }
+
+        // Check for SCHEDULED
+        if let Some(caps) = scheduled_re.captures(line) {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(&caps[1], "%Y-%m-%d") {
+                items.push(AgendaItem {
+                    file_path: file_path.to_path_buf(),
+                    headline: current_headline.clone(),
+                    date,
+                    entry_type: AgendaEntryType::Scheduled,
+                    line_number: line_num as u32,
+                    tags: current_tags.clone(),
+                    todo_keyword: current_todo.clone(),
+                });
+            }
+        }
+
+        // Check for DEADLINE
+        if let Some(caps) = deadline_re.captures(line) {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(&caps[1], "%Y-%m-%d") {
+                items.push(AgendaItem {
+                    file_path: file_path.to_path_buf(),
+                    headline: current_headline.clone(),
+                    date,
+                    entry_type: AgendaEntryType::Deadline,
+                    line_number: line_num as u32,
+                    tags: current_tags.clone(),
+                    todo_keyword: current_todo.clone(),
+                });
+            }
+        }
+
+        // Check for CLOSED
+        if let Some(caps) = closed_re.captures(line) {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(&caps[1], "%Y-%m-%d") {
+                items.push(AgendaItem {
+                    file_path: file_path.to_path_buf(),
+                    headline: current_headline.clone(),
+                    date,
+                    entry_type: AgendaEntryType::Closed,
+                    line_number: line_num as u32,
+                    tags: current_tags.clone(),
+                    todo_keyword: current_todo.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn open_agenda_item(
+    workspace: &mut Workspace,
+    item: &AgendaItem,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let path = item.file_path.clone();
+    // TODO: Navigate to line item.line_number - for now just opens file
+
+    workspace
+        .open_paths(
+            vec![path],
+            workspace::OpenOptions::default(),
+            None,
+            window,
+            cx,
+        )
+        .detach();
+}
+
+// Agenda tag filter picker
+pub struct AgendaTagPickerDelegate {
+    tags: Vec<String>,
+    matches: Vec<StringMatch>,
+    agenda_view: WeakEntity<AgendaView>,
+}
+
+impl AgendaTagPickerDelegate {
+    fn new(tags: Vec<String>, agenda_view: WeakEntity<AgendaView>) -> Self {
+        let mut all_tags = vec!["All (clear filter)".to_string()];
+        all_tags.extend(tags);
+
+        Self {
+            tags: all_tags.clone(),
+            matches: all_tags
+                .iter()
+                .enumerate()
+                .map(|(index, tag)| StringMatch {
+                    candidate_id: index,
+                    string: tag.clone(),
+                    positions: Vec::new(),
+                    score: 0.0,
+                })
+                .collect(),
+            agenda_view,
+        }
+    }
+}
+
+impl PickerDelegate for AgendaTagPickerDelegate {
+    type ListItem = ui::ListItem;
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        0
+    }
+
+    fn set_selected_index(
+        &mut self,
+        _ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Select tag to filter by...".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> gpui::Task<()> {
+        let candidates = self
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(id, tag)| StringMatchCandidate {
+                id,
+                string: tag.clone(),
+                char_bag: tag.chars().collect(),
+            })
+            .collect::<Vec<_>>();
+
+        let background_executor = cx.background_executor().clone();
+        cx.spawn_in(_window, async move |this, cx| {
+            let matches = if query.is_empty() {
+                candidates
+                    .into_iter()
+                    .map(|candidate| StringMatch {
+                        candidate_id: candidate.id,
+                        string: candidate.string,
+                        positions: Vec::new(),
+                        score: 0.0,
+                    })
+                    .collect()
+            } else {
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    false,
+                    usize::MAX,
+                    &Default::default(),
+                    background_executor,
+                )
+                .await
+            };
+
+            this.update(cx, |this, cx| {
+                this.delegate.matches = matches;
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(mat) = self.matches.first() {
+            let tag = &self.tags[mat.candidate_id];
+
+            if let Some(agenda_view) = self.agenda_view.upgrade() {
+                agenda_view.update(cx, |view, cx| {
+                    if tag == "All (clear filter)" {
+                        view.filter_tag = None;
+                    } else {
+                        view.filter_tag = Some(tag.clone());
+                    }
+                    view.apply_filters();
+                    cx.notify();
+                });
+            }
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let mat = self.matches.get(ix)?;
+        let tag = &self.tags[mat.candidate_id];
+
+        Some(
+            ui::ListItem::new(ix)
+                .inset(true)
+                .spacing(ui::ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(ui::Label::new(tag.clone())),
+        )
+    }
+}
+
+// Agenda file filter picker
+pub struct AgendaFilePickerDelegate {
+    files: Vec<String>,
+    matches: Vec<StringMatch>,
+    agenda_view: WeakEntity<AgendaView>,
+}
+
+impl AgendaFilePickerDelegate {
+    fn new(files: Vec<String>, agenda_view: WeakEntity<AgendaView>) -> Self {
+        let mut all_files = vec!["All (clear filter)".to_string()];
+        all_files.extend(files);
+
+        Self {
+            files: all_files.clone(),
+            matches: all_files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| StringMatch {
+                    candidate_id: index,
+                    string: file.clone(),
+                    positions: Vec::new(),
+                    score: 0.0,
+                })
+                .collect(),
+            agenda_view,
+        }
+    }
+}
+
+impl PickerDelegate for AgendaFilePickerDelegate {
+    type ListItem = ui::ListItem;
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        0
+    }
+
+    fn set_selected_index(
+        &mut self,
+        _ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Select file to filter by...".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> gpui::Task<()> {
+        let candidates = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(id, file)| StringMatchCandidate {
+                id,
+                string: file.clone(),
+                char_bag: file.chars().collect(),
+            })
+            .collect::<Vec<_>>();
+
+        let background_executor = cx.background_executor().clone();
+        cx.spawn_in(_window, async move |this, cx| {
+            let matches = if query.is_empty() {
+                candidates
+                    .into_iter()
+                    .map(|candidate| StringMatch {
+                        candidate_id: candidate.id,
+                        string: candidate.string,
+                        positions: Vec::new(),
+                        score: 0.0,
+                    })
+                    .collect()
+            } else {
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    false,
+                    usize::MAX,
+                    &Default::default(),
+                    background_executor,
+                )
+                .await
+            };
+
+            this.update(cx, |this, cx| {
+                this.delegate.matches = matches;
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(mat) = self.matches.first() {
+            let file = &self.files[mat.candidate_id];
+
+            if let Some(agenda_view) = self.agenda_view.upgrade() {
+                agenda_view.update(cx, |view, cx| {
+                    if file == "All (clear filter)" {
+                        view.filter_file = None;
+                    } else {
+                        view.filter_file = Some(file.clone());
+                    }
+                    view.apply_filters();
+                    cx.notify();
+                });
+            }
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let mat = self.matches.get(ix)?;
+        let file = &self.files[mat.candidate_id];
+
+        Some(
+            ui::ListItem::new(ix)
+                .inset(true)
+                .spacing(ui::ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(ui::Label::new(file.clone())),
+        )
+    }
+}
 
 // Tag completion provider for org-mode files
 pub struct TagCompletionProvider {}
