@@ -1,4 +1,7 @@
+mod deadline_notification;
+
 use chrono::{Local, NaiveTime, Timelike};
+use deadline_notification::{DeadlineNotification, DeadlineNotificationEvent};
 use editor::scroll::Autoscroll;
 use editor::{self, Editor, SelectionEffects, ToPoint};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
@@ -57,6 +60,8 @@ actions!(
         DatePickerPreviousWeek,
         /// Increases the date by one week in the date picker.
         DatePickerNextWeek,
+        /// Cycles through reminder options in the date picker (None -> 10m -> 1h -> 1d -> 1w).
+        DatePickerCycleReminder,
         /// Opens the agenda view showing scheduled and deadline tasks.
         OpenAgenda,
         /// Toggles showing completed (DONE/CLOSED) items in agenda.
@@ -812,6 +817,242 @@ pub fn cycle_todo_state(
     });
 }
 
+fn format_reminder_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs % (7 * 86400) == 0 {
+        format!("{}w", secs / (7 * 86400))
+    } else if secs % 86400 == 0 {
+        format!("{}d", secs / 86400)
+    } else if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Calculate the next occurrence date for a recurring task based on repeater info.
+///
+/// Repeater types:
+/// - Cumulative (+): Shift from the original date by interval
+/// - CatchUp (++): Shift from today until the date is in the future
+/// - Restart (.+): Shift from the completion date (today)
+fn calculate_next_occurrence(
+    current_date: chrono::NaiveDate,
+    repeater: &RepeaterInfo,
+    completion_date: Option<chrono::NaiveDate>,
+) -> chrono::NaiveDate {
+    use chrono::Datelike;
+
+    let base_date = match repeater.repeater_type {
+        RepeaterType::Cumulative => current_date, // Shift from original date
+        RepeaterType::CatchUp => current_date,    // Will loop until future
+        RepeaterType::Restart => {
+            completion_date.unwrap_or_else(|| Local::now().naive_local().date())
+        } // From completion
+    };
+
+    let mut next_date = match repeater.unit {
+        RepeaterUnit::Day => base_date + chrono::Duration::days(repeater.interval),
+        RepeaterUnit::Week => base_date + chrono::Duration::weeks(repeater.interval),
+        RepeaterUnit::Month => {
+            // Handle month arithmetic more carefully
+            let mut year = base_date.year();
+            let mut month = base_date.month() as i32 + repeater.interval as i32;
+
+            while month > 12 {
+                month -= 12;
+                year += 1;
+            }
+            while month < 1 {
+                month += 12;
+                year -= 1;
+            }
+
+            let day = base_date.day().min(days_in_month(year, month as u32));
+            chrono::NaiveDate::from_ymd_opt(year, month as u32, day)
+                .unwrap_or(base_date + chrono::Duration::days(30 * repeater.interval))
+        }
+        RepeaterUnit::Year => {
+            let new_year = base_date.year() + repeater.interval as i32;
+            let month = base_date.month();
+            let day = base_date.day().min(days_in_month(new_year, month));
+            chrono::NaiveDate::from_ymd_opt(new_year, month, day)
+                .unwrap_or(base_date + chrono::Duration::days(365 * repeater.interval))
+        }
+    };
+
+    // For CatchUp (++), keep adding intervals until the date is in the future
+    if repeater.repeater_type == RepeaterType::CatchUp {
+        let today = Local::now().naive_local().date();
+        while next_date <= today {
+            next_date = match repeater.unit {
+                RepeaterUnit::Day => next_date + chrono::Duration::days(repeater.interval),
+                RepeaterUnit::Week => next_date + chrono::Duration::weeks(repeater.interval),
+                RepeaterUnit::Month => {
+                    let mut year = next_date.year();
+                    let mut month = next_date.month() as i32 + repeater.interval as i32;
+
+                    while month > 12 {
+                        month -= 12;
+                        year += 1;
+                    }
+
+                    let day = next_date.day().min(days_in_month(year, month as u32));
+                    chrono::NaiveDate::from_ymd_opt(year, month as u32, day)
+                        .unwrap_or(next_date + chrono::Duration::days(30 * repeater.interval))
+                }
+                RepeaterUnit::Year => {
+                    let new_year = next_date.year() + repeater.interval as i32;
+                    let month = next_date.month();
+                    let day = next_date.day().min(days_in_month(new_year, month));
+                    chrono::NaiveDate::from_ymd_opt(new_year, month, day)
+                        .unwrap_or(next_date + chrono::Duration::days(365 * repeater.interval))
+                }
+            };
+        }
+    }
+
+    next_date
+}
+
+/// Helper to get the number of days in a given month
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Reschedule a recurring task by updating its timestamp to the next occurrence.
+/// This is called when a task with a repeater is marked DONE.
+pub fn reschedule_recurring_task(
+    _workspace: &Workspace,
+    file_path: &Path,
+    line_number: u32,
+    current_date: chrono::NaiveDate,
+    repeater: &RepeaterInfo,
+    entry_type: &AgendaEntryType,
+    _cx: &mut Context<Workspace>,
+) {
+    use std::io::{Read, Seek, Write};
+
+    // Calculate the next occurrence
+    let next_date = calculate_next_occurrence(
+        current_date,
+        repeater,
+        Some(Local::now().naive_local().date()),
+    );
+
+    // Read the file
+    let mut file = match OpenOptions::new().read(true).write(true).open(file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("Failed to open file for rescheduling: {}", e);
+            return;
+        }
+    };
+
+    let mut content = String::new();
+    if let Err(e) = file.read_to_string(&mut content) {
+        log::error!("Failed to read file: {}", e);
+        return;
+    }
+
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    // Find the line with the timestamp
+    if (line_number as usize) >= lines.len() {
+        log::error!("Line number {} out of bounds", line_number);
+        return;
+    }
+
+    // Look for the timestamp line (might be on the same line or next few lines)
+    let start_idx = line_number as usize;
+    let end_idx = (start_idx + 5).min(lines.len());
+
+    for i in start_idx..end_idx {
+        let line = &lines[i];
+
+        // Check if this line contains the timestamp we need to update
+        let prefix = match entry_type {
+            AgendaEntryType::Scheduled => "SCHEDULED:",
+            AgendaEntryType::Deadline => "DEADLINE:",
+            _ => continue,
+        };
+
+        if line.contains(prefix) {
+            // Format the repeater string
+            let repeater_str = format!(
+                "{}{}{}",
+                match repeater.repeater_type {
+                    RepeaterType::Cumulative => "+",
+                    RepeaterType::CatchUp => "++",
+                    RepeaterType::Restart => ".+",
+                },
+                repeater.interval,
+                match repeater.unit {
+                    RepeaterUnit::Day => "d",
+                    RepeaterUnit::Week => "w",
+                    RepeaterUnit::Month => "m",
+                    RepeaterUnit::Year => "y",
+                }
+            );
+
+            // Get the weekday abbreviation
+            let weekday = next_date.format("%a").to_string();
+
+            // Build the new timestamp with repeater
+            let new_timestamp = format!(
+                "{} <{} {} {}>",
+                prefix,
+                next_date.format("%Y-%m-%d"),
+                weekday,
+                repeater_str
+            );
+
+            // Replace the line, preserving indentation
+            let indent = line
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>();
+            lines[i] = format!("{}{}", indent, new_timestamp);
+
+            // Write the updated content back
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
+                log::error!("Failed to seek file: {}", e);
+                return;
+            }
+
+            let new_content = lines.join("\n") + "\n";
+            if let Err(e) = file.set_len(0) {
+                log::error!("Failed to truncate file: {}", e);
+                return;
+            }
+            if let Err(e) = file.write_all(new_content.as_bytes()) {
+                log::error!("Failed to write file: {}", e);
+                return;
+            }
+
+            log::info!(
+                "Rescheduled recurring task from {} to {}",
+                current_date,
+                next_date
+            );
+            break;
+        }
+    }
+}
+
 pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     log::info!("schedule_task called");
     let Some(_editor) = workspace
@@ -830,7 +1071,7 @@ pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
     workspace.toggle_modal(window, cx, |window, cx| {
         DatePickerModal::new(
             tomorrow,
-            move |selected_date, _window, cx| {
+            move |selected_date, reminder_duration, _window, cx| {
                 let Some(workspace) = workspace_weak.upgrade() else {
                     return;
                 };
@@ -844,11 +1085,17 @@ pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
                     };
 
                     let weekday = selected_date.format("%a").to_string();
-                    let schedule_line = format!(
+                    let mut schedule_line = format!(
                         "SCHEDULED: <{} {}>",
                         selected_date.format("%Y-%m-%d"),
                         weekday
                     );
+
+                    // Add REMIND line if reminder was selected
+                    if let Some(duration) = reminder_duration {
+                        let remind_str = format_reminder_duration(duration);
+                        schedule_line.push_str(&format!("\nREMIND: {}", remind_str));
+                    }
 
                     editor.update(cx, |editor, cx| {
                         let buffer = editor.buffer().read(cx);
@@ -947,7 +1194,7 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
     workspace.toggle_modal(window, cx, |window, cx| {
         DatePickerModal::new(
             deadline_date,
-            move |selected_date, _window, cx| {
+            move |selected_date, reminder_duration, _window, cx| {
                 let Some(workspace) = workspace_weak.upgrade() else {
                     return;
                 };
@@ -961,11 +1208,17 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
                     };
 
                     let weekday = selected_date.format("%a").to_string();
-                    let deadline_line = format!(
+                    let mut deadline_line = format!(
                         "DEADLINE: <{} {}>",
                         selected_date.format("%Y-%m-%d"),
                         weekday
                     );
+
+                    // Add REMIND line if reminder was selected
+                    if let Some(duration) = reminder_duration {
+                        let remind_str = format_reminder_duration(duration);
+                        deadline_line.push_str(&format!("\nREMIND: {}", remind_str));
+                    }
 
                     editor.update(cx, |editor, cx| {
                         let buffer = editor.buffer().read(cx);
@@ -2582,14 +2835,18 @@ impl PickerDelegate for TagPickerDelegate {
 // Date picker modal for scheduling and deadlines
 pub struct DatePickerModal {
     selected_date: chrono::NaiveDate,
-    on_confirm: Option<Box<dyn FnOnce(chrono::NaiveDate, &mut Window, &mut App)>>,
+    selected_reminder: Option<std::time::Duration>,
+    on_confirm: Option<
+        Box<dyn FnOnce(chrono::NaiveDate, Option<std::time::Duration>, &mut Window, &mut App)>,
+    >,
     focus_handle: FocusHandle,
 }
 
 impl DatePickerModal {
     pub fn new(
         initial_date: chrono::NaiveDate,
-        on_confirm: impl FnOnce(chrono::NaiveDate, &mut Window, &mut App) + 'static,
+        on_confirm: impl FnOnce(chrono::NaiveDate, Option<std::time::Duration>, &mut Window, &mut App)
+        + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2598,9 +2855,22 @@ impl DatePickerModal {
 
         Self {
             selected_date: initial_date,
+            selected_reminder: None,
             on_confirm: Some(Box::new(on_confirm)),
             focus_handle,
         }
+    }
+
+    fn cycle_reminder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // Cycle through: None -> 10m -> 1h -> 1d -> 1w -> None
+        self.selected_reminder = match self.selected_reminder {
+            None => Some(std::time::Duration::from_secs(10 * 60)), // 10 minutes
+            Some(d) if d.as_secs() == 10 * 60 => Some(std::time::Duration::from_secs(3600)), // 1 hour
+            Some(d) if d.as_secs() == 3600 => Some(std::time::Duration::from_secs(86400)), // 1 day
+            Some(d) if d.as_secs() == 86400 => Some(std::time::Duration::from_secs(7 * 86400)), // 1 week
+            _ => None,
+        };
+        cx.notify();
     }
 
     fn adjust_date(&mut self, days: i64, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2615,7 +2885,7 @@ impl DatePickerModal {
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(on_confirm) = self.on_confirm.take() {
-            on_confirm(self.selected_date, window, cx);
+            on_confirm(self.selected_date, self.selected_reminder, window, cx);
             cx.emit(DismissEvent);
         }
     }
@@ -2644,12 +2914,39 @@ impl DatePickerModal {
     ) {
         self.adjust_date(-7, window, cx);
     }
+
+    fn cycle_reminder_action(
+        &mut self,
+        _: &DatePickerCycleReminder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_reminder(window, cx);
+    }
 }
 
 impl Render for DatePickerModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let weekday = self.selected_date.format("%A").to_string();
         let formatted_date = self.selected_date.format("%Y-%m-%d").to_string();
+
+        let reminder_text = match self.selected_reminder {
+            None => "None".to_string(),
+            Some(d) => {
+                let secs = d.as_secs();
+                if secs == 10 * 60 {
+                    "10 minutes".to_string()
+                } else if secs == 3600 {
+                    "1 hour".to_string()
+                } else if secs == 86400 {
+                    "1 day".to_string()
+                } else if secs == 7 * 86400 {
+                    "1 week".to_string()
+                } else {
+                    format!("{}s", secs)
+                }
+            }
+        };
 
         v_flex()
             .key_context("DatePickerModal")
@@ -2662,6 +2959,7 @@ impl Render for DatePickerModal {
             .on_action(cx.listener(Self::next_day))
             .on_action(cx.listener(Self::prev_week))
             .on_action(cx.listener(Self::next_week))
+            .on_action(cx.listener(Self::cycle_reminder_action))
             .p_4()
             .gap_2()
             .child(
@@ -2686,17 +2984,42 @@ impl Render for DatePickerModal {
                     ),
             )
             .child(
-                h_flex()
-                    .justify_center()
-                    .gap_2()
-                    .mt_4()
-                    .child(Label::new("Use ↑/↓ for ±1 day, ←/→ for ±7 days")),
+                h_flex().justify_center().gap_2().mt_4().child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Label::new("Reminder:").size(LabelSize::Small))
+                                .child(Label::new(reminder_text).size(LabelSize::Small).color(
+                                    if self.selected_reminder.is_some() {
+                                        Color::Accent
+                                    } else {
+                                        Color::Muted
+                                    },
+                                )),
+                        )
+                        .child(
+                            Label::new("Press 'r' to cycle reminder options")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                ),
             )
             .child(
-                h_flex()
-                    .justify_center()
-                    .gap_2()
-                    .child(Label::new("Press Enter to confirm, Esc to cancel")),
+                h_flex().justify_center().gap_2().mt_2().child(
+                    Label::new("Use ↑/↓ for ±1 day, ←/→ for ±7 days")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(
+                h_flex().justify_center().gap_2().child(
+                    Label::new("Press Enter to confirm, Esc to cancel")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
             )
     }
 }
@@ -2720,6 +3043,31 @@ pub struct AgendaItem {
     pub line_number: u32,
     pub tags: Vec<String>,
     pub todo_keyword: Option<String>,
+    pub warning_days: Option<i64>, // Number of days before deadline to warn (e.g., -5d means 5 days before)
+    pub reminder_duration: Option<std::time::Duration>, // Duration before deadline to remind (e.g., REMIND: 10m, 1d)
+    pub repeater: Option<RepeaterInfo>, // Repeater interval for recurring tasks (e.g., +1w, .+1d)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepeaterInfo {
+    pub interval: i64,               // Number of units (e.g., 1, 2, 7)
+    pub unit: RepeaterUnit,          // Unit type (day, week, month, year)
+    pub repeater_type: RepeaterType, // Type of repeater (+, ++, .+)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepeaterUnit {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepeaterType {
+    Cumulative, // + : shift from original date
+    CatchUp,    // ++ : shift from today until future
+    Restart,    // .+ : shift from completion date
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2741,13 +3089,15 @@ pub struct AgendaView {
     available_tags: Vec<String>,
     available_files: Vec<String>,
     days_range: i64, // Number of days to show (0 = all, 7 = week, 30 = month)
+    shown_reminders: std::collections::HashSet<String>, // Track which reminders have been shown
+    _reminder_timer: Option<gpui::Task<()>>, // Background timer for checking reminders
 }
 
 impl AgendaView {
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
-        Self {
+        let mut view = Self {
             focus_handle,
             items: Vec::new(),
             all_items: Vec::new(),
@@ -2759,7 +3109,180 @@ impl AgendaView {
             available_tags: Vec::new(),
             available_files: Vec::new(),
             days_range: 30, // Default to 30 days
+            shown_reminders: std::collections::HashSet::new(),
+            _reminder_timer: None,
+        };
+
+        // Start the background reminder checker
+        view.start_reminder_timer(cx);
+        view
+    }
+
+    fn start_reminder_timer(&mut self, _cx: &mut Context<Self>) {
+        // For now, just check reminders on every collect_agenda_items call
+        // A full background timer implementation would require more complex async handling
+        // that's better suited for a future enhancement
+
+        // Placeholder to satisfy the field requirement
+        self._reminder_timer = None;
+    }
+
+    fn check_deadline_reminders(&mut self, cx: &mut Context<Self>) {
+        let now = Local::now().naive_local();
+
+        // Collect reminders to show (to avoid borrow checker issues)
+        let mut reminders_to_show = Vec::new();
+
+        // Check all items with REMIND durations
+        for item in &self.all_items {
+            // Only check SCHEDULED and DEADLINE items
+            if item.entry_type != AgendaEntryType::Deadline
+                && item.entry_type != AgendaEntryType::Scheduled
+            {
+                continue;
+            }
+
+            // Skip DONE tasks
+            if let Some(todo) = &item.todo_keyword {
+                if todo == "DONE" {
+                    continue;
+                }
+            }
+
+            // Skip items without REMIND duration
+            let reminder_duration = match item.reminder_duration {
+                Some(d) => d,
+                None => {
+                    log::info!("Skipping item without REMIND: {}", item.headline);
+                    continue;
+                }
+            };
+
+            log::info!(
+                "Checking reminder for: {} (deadline: {}, remind: {:?})",
+                item.headline,
+                item.date,
+                reminder_duration
+            );
+
+            // Create a unique ID for this reminder
+            let reminder_id = format!("{}-{}", item.file_path.display(), item.line_number);
+
+            // Skip if we've already shown this reminder
+            if self.shown_reminders.contains(&reminder_id) {
+                log::info!("Reminder already shown: {}", reminder_id);
+                continue;
+            }
+
+            // Convert deadline date to datetime at end of day (23:59:59) to be more lenient
+            let deadline_datetime = item.date.and_hms_opt(23, 59, 59).unwrap();
+
+            // Calculate when the reminder should trigger
+            let reminder_chrono_duration = chrono::Duration::from_std(reminder_duration).unwrap();
+            let reminder_time = deadline_datetime - reminder_chrono_duration;
+
+            log::info!(
+                "Now: {}, Reminder time: {}, Deadline: {}",
+                now,
+                reminder_time,
+                deadline_datetime
+            );
+
+            // Check if we should show the reminder now
+            // Show if current time is past the reminder time but before the deadline
+            if now >= reminder_time && now <= deadline_datetime {
+                log::info!("TRIGGERING reminder for: {}", item.headline);
+
+                // Calculate urgency message
+                let days_until = (item.date - now.date()).num_days();
+                let urgency = if days_until == 0 {
+                    "TODAY".to_string()
+                } else if days_until == 1 {
+                    "TOMORROW".to_string()
+                } else {
+                    format!("in {} days", days_until)
+                };
+
+                reminders_to_show.push((
+                    reminder_id,
+                    item.headline.clone(),
+                    item.date.format("%Y-%m-%d").to_string(),
+                    urgency,
+                    item.file_path.clone(),
+                    item.line_number,
+                ));
+            } else {
+                log::info!("Not yet time for reminder: {}", item.headline);
+            }
         }
+
+        log::info!("Total reminders to show: {}", reminders_to_show.len());
+
+        // Now spawn notifications for collected reminders
+        for (reminder_id, headline, date_str, urgency, file_path, line_number) in reminders_to_show
+        {
+            // Mark this reminder as shown
+            self.shown_reminders.insert(reminder_id);
+
+            // Spawn notification window
+            self.spawn_reminder_notification(
+                headline,
+                date_str,
+                urgency,
+                file_path,
+                line_number,
+                cx,
+            );
+        }
+    }
+
+    fn spawn_reminder_notification(
+        &mut self,
+        task_name: String,
+        deadline_date: String,
+        urgency: String,
+        file_path: PathBuf,
+        line_number: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = match self.workspace.upgrade() {
+            Some(ws) => ws,
+            None => return,
+        };
+
+        // Get the displays to position the notification
+        let displays = cx.displays();
+        let display = displays.first().cloned();
+        let Some(display) = display else { return };
+
+        let options = DeadlineNotification::window_options(display, cx);
+
+        // Open the notification window
+        // The notification handles button clicks internally
+        let _ = cx.open_window(options, |_window, cx| {
+            cx.new(|_| {
+                DeadlineNotification::new(
+                    task_name.clone(),
+                    deadline_date.clone(),
+                    urgency.clone(),
+                    file_path.clone(),
+                    line_number,
+                    workspace.downgrade(),
+                )
+            })
+        });
+
+        // Also show a toast as backup
+        let message = format!("⏰ Reminder {}: {} ({})", urgency, task_name, deadline_date);
+        cx.defer(move |cx| {
+            let _ = workspace.update(cx, |workspace, cx| {
+                let toast = workspace::Toast::new(
+                    workspace::notifications::NotificationId::unique::<DeadlineNotification>(),
+                    message,
+                );
+                workspace.show_toast(toast, cx);
+            });
+        });
     }
 
     fn toggle_show_done(
@@ -3032,6 +3555,10 @@ impl AgendaView {
 
         // Apply current filters
         self.apply_filters();
+
+        // Check for deadline reminders
+        self.check_deadline_reminders(cx);
+
         cx.notify();
     }
 
@@ -3344,18 +3871,78 @@ fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut 
     use regex::Regex;
 
     // Regex to match SCHEDULED/DEADLINE/CLOSED with dates
-    let scheduled_re = Regex::new(r"SCHEDULED:\s*<(\d{4}-\d{2}-\d{2})").unwrap();
-    let deadline_re = Regex::new(r"DEADLINE:\s*<(\d{4}-\d{2}-\d{2})").unwrap();
+    // DEADLINE can include warning period like: DEADLINE: <2024-12-25 Wed -5d>
+    // REMIND syntax: REMIND: 10m, REMIND: 1h, REMIND: 2d, etc.
+    // Repeater syntax: +1w, .+1d, ++1m (after the weekday in timestamp)
+    let scheduled_re =
+        Regex::new(r"SCHEDULED:\s*<(\d{4}-\d{2}-\d{2})\s+\w+(?:\s+([.+]{1,2})(\d+)([dwmy]))?")
+            .unwrap();
+    let deadline_re = Regex::new(
+        r"DEADLINE:\s*<(\d{4}-\d{2}-\d{2})\s+\w+(?:\s+([.+]{1,2})(\d+)([dwmy]))?(?:\s+(-?\d+)d)?",
+    )
+    .unwrap();
     let closed_re = Regex::new(r"CLOSED:\s*\[(\d{4}-\d{2}-\d{2})").unwrap();
+    let remind_re = Regex::new(r"REMIND:\s*(\d+)(m|h|d|w)").unwrap();
     let tag_re = Regex::new(r":([a-zA-Z0-9_@]+):").unwrap();
     let todo_re =
         Regex::new(r"^\*+\s+(TODO|DONE|DOING|WAITING|NEXT|STARTED|CANCELLED|CANCELED|DEFERRED)\s+")
             .unwrap();
 
+    // Helper function to parse reminder duration from REMIND: syntax
+    fn parse_reminder_duration(line: &str, remind_re: &Regex) -> Option<std::time::Duration> {
+        remind_re.captures(line).and_then(|caps| {
+            let value: u64 = caps[1].parse().ok()?;
+            let unit = &caps[2];
+
+            Some(match unit {
+                "m" => std::time::Duration::from_secs(value * 60),
+                "h" => std::time::Duration::from_secs(value * 3600),
+                "d" => std::time::Duration::from_secs(value * 86400),
+                "w" => std::time::Duration::from_secs(value * 604800),
+                _ => return None,
+            })
+        })
+    }
+
+    // Helper function to parse repeater from captured regex groups
+    fn parse_repeater(
+        repeater_type_str: Option<&str>,
+        interval_str: Option<&str>,
+        unit_str: Option<&str>,
+    ) -> Option<RepeaterInfo> {
+        let repeater_type_str = repeater_type_str?;
+        let interval_str = interval_str?;
+        let unit_str = unit_str?;
+
+        let interval: i64 = interval_str.parse().ok()?;
+
+        let repeater_type = match repeater_type_str {
+            "+" => RepeaterType::Cumulative,
+            "++" => RepeaterType::CatchUp,
+            ".+" => RepeaterType::Restart,
+            _ => return None,
+        };
+
+        let unit = match unit_str {
+            "d" => RepeaterUnit::Day,
+            "w" => RepeaterUnit::Week,
+            "m" => RepeaterUnit::Month,
+            "y" => RepeaterUnit::Year,
+            _ => return None,
+        };
+
+        Some(RepeaterInfo {
+            interval,
+            unit,
+            repeater_type,
+        })
+    }
+
     let lines: Vec<&str> = content.lines().collect();
     let mut current_headline = String::new();
     let mut current_tags: Vec<String> = Vec::new();
     let mut current_todo: Option<String> = None;
+    let mut current_reminder: Option<std::time::Duration> = None;
 
     for (line_num, line) in lines.iter().enumerate() {
         // Check if this is a headline
@@ -3389,11 +3976,41 @@ fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut 
             headline_text = headline_text.trim_start_matches('*').trim().to_string();
 
             current_headline = headline_text;
+
+            // Reset reminder for new headline
+            current_reminder = None;
+        }
+
+        // Check for REMIND syntax (can appear on any line under a headline)
+        if let Some(duration) = parse_reminder_duration(line, &remind_re) {
+            current_reminder = Some(duration);
         }
 
         // Check for SCHEDULED
         if let Some(caps) = scheduled_re.captures(line) {
             if let Ok(date) = chrono::NaiveDate::parse_from_str(&caps[1], "%Y-%m-%d") {
+                // Parse repeater if present (groups 2, 3, 4)
+                let repeater = parse_repeater(
+                    caps.get(2).map(|m| m.as_str()),
+                    caps.get(3).map(|m| m.as_str()),
+                    caps.get(4).map(|m| m.as_str()),
+                );
+
+                // Look ahead for REMIND on the next few lines
+                let mut reminder_for_this_item = current_reminder;
+                for next_line_idx in (line_num + 1)..lines.len().min(line_num + 5) {
+                    let next_line = lines[next_line_idx];
+                    // Stop if we hit another headline
+                    if next_line.trim_start().starts_with('*') {
+                        break;
+                    }
+                    // Check for REMIND
+                    if let Some(duration) = parse_reminder_duration(next_line, &remind_re) {
+                        reminder_for_this_item = Some(duration);
+                        break;
+                    }
+                }
+
                 items.push(AgendaItem {
                     file_path: file_path.to_path_buf(),
                     headline: current_headline.clone(),
@@ -3402,6 +4019,9 @@ fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut 
                     line_number: line_num as u32,
                     tags: current_tags.clone(),
                     todo_keyword: current_todo.clone(),
+                    warning_days: None, // Scheduled items don't have warnings
+                    reminder_duration: reminder_for_this_item,
+                    repeater,
                 });
             }
         }
@@ -3409,6 +4029,32 @@ fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut 
         // Check for DEADLINE
         if let Some(caps) = deadline_re.captures(line) {
             if let Ok(date) = chrono::NaiveDate::parse_from_str(&caps[1], "%Y-%m-%d") {
+                // Parse repeater if present (groups 2, 3, 4)
+                let repeater = parse_repeater(
+                    caps.get(2).map(|m| m.as_str()),
+                    caps.get(3).map(|m| m.as_str()),
+                    caps.get(4).map(|m| m.as_str()),
+                );
+
+                // Extract warning days if present (e.g., -5d means warn 5 days before)
+                // Note: warning days is now in group 5 after the repeater groups
+                let warning_days = caps.get(5).and_then(|m| m.as_str().parse::<i64>().ok());
+
+                // Look ahead for REMIND on the next few lines
+                let mut reminder_for_this_item = current_reminder;
+                for next_line_idx in (line_num + 1)..lines.len().min(line_num + 5) {
+                    let next_line = lines[next_line_idx];
+                    // Stop if we hit another headline
+                    if next_line.trim_start().starts_with('*') {
+                        break;
+                    }
+                    // Check for REMIND
+                    if let Some(duration) = parse_reminder_duration(next_line, &remind_re) {
+                        reminder_for_this_item = Some(duration);
+                        break;
+                    }
+                }
+
                 items.push(AgendaItem {
                     file_path: file_path.to_path_buf(),
                     headline: current_headline.clone(),
@@ -3417,6 +4063,9 @@ fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut 
                     line_number: line_num as u32,
                     tags: current_tags.clone(),
                     todo_keyword: current_todo.clone(),
+                    warning_days,
+                    reminder_duration: reminder_for_this_item,
+                    repeater,
                 });
             }
         }
@@ -3432,6 +4081,9 @@ fn extract_agenda_items(file_path: &std::path::Path, content: &str, items: &mut 
                     line_number: line_num as u32,
                     tags: current_tags.clone(),
                     todo_keyword: current_todo.clone(),
+                    warning_days: None, // Closed items don't have warnings
+                    repeater: None,     // Closed items don't have repeaters
+                    reminder_duration: current_reminder,
                 });
             }
         }
