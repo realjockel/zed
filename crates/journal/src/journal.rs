@@ -56,12 +56,16 @@ actions!(
         ScheduleTask,
         /// Sets a deadline for the current task.
         SetDeadline,
+        /// Adds or modifies recurring interval for a scheduled/deadline task.
+        SetRecurring,
         /// Decreases the date by one week in the date picker.
         DatePickerPreviousWeek,
         /// Increases the date by one week in the date picker.
         DatePickerNextWeek,
         /// Cycles through reminder options in the date picker (None -> 10m -> 1h -> 1d -> 1w).
         DatePickerCycleReminder,
+        /// Cycles through repeater/recurring options in the date picker (None -> +1d -> +1w -> +2w -> +1m -> +3m -> +1y -> ++1d -> ++1w -> .+1d -> .+1w).
+        DatePickerCycleRepeater,
         /// Opens the agenda view showing scheduled and deadline tasks.
         OpenAgenda,
         /// Toggles showing completed (DONE/CLOSED) items in agenda.
@@ -201,6 +205,9 @@ pub fn init(_: Arc<AppState>, cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &SetDeadline, window, cx| {
                 set_deadline(workspace, window, cx);
+            });
+            workspace.register_action(|workspace, _: &SetRecurring, window, cx| {
+                set_recurring(workspace, window, cx);
             });
             workspace.register_action(|workspace, _: &OpenAgenda, window, cx| {
                 open_agenda(workspace, window, cx);
@@ -754,7 +761,109 @@ pub fn cycle_todo_state(
             }
         };
 
-        // Now construct the edit based on the new keyword
+        // Check if we're transitioning to a DONE state and if there's a recurring task
+        let transitioning_to_done = if let Some(ref new_kw) = new_keyword {
+            done_keywords.contains(new_kw)
+        } else {
+            false
+        };
+
+        // If transitioning to done, check for recurring timestamps
+        if transitioning_to_done {
+            // Check the section for SCHEDULED or DEADLINE with repeater
+            let headline_end = headline_node.end_byte();
+            let buffer_text = buffer_snapshot.text();
+            let text_after_headline = &buffer_text[headline_end..];
+            let search_end = text_after_headline
+                .find("\n*")
+                .unwrap_or(text_after_headline.len());
+            let section_text = &text_after_headline[..search_end];
+
+            // Look for recurring timestamps
+            if let Some((entry_type, current_date, repeater)) = extract_recurring_info(section_text)
+            {
+                // Clone the headline text for the new task
+                let headline_text = buffer_snapshot
+                    .text_for_range(headline_node.byte_range())
+                    .collect::<String>();
+
+                // Calculate next occurrence
+                let next_date = calculate_next_occurrence(
+                    current_date,
+                    &repeater,
+                    Some(Local::now().naive_local().date()),
+                );
+
+                // Create new task after applying the edit
+                let new_task_headline = create_recurring_task(
+                    &headline_text,
+                    &todo_keywords[0],
+                    next_date,
+                    &repeater,
+                    entry_type,
+                );
+
+                // Get insertion position - after the entire headline section
+                let insert_pos = headline_end
+                    + section_text
+                        .find("\n*")
+                        .map(|p| p + 1)
+                        .unwrap_or(section_text.len());
+
+                // Apply the status change and insert new task
+                singleton_buffer.update(cx, |buffer, cx| {
+                    // First, change the current task status
+                    let edit_range;
+                    let new_text;
+
+                    if let Some(new_kw) = new_keyword.clone() {
+                        if let Some(kw_node) = keyword_node {
+                            edit_range = kw_node.byte_range();
+                            new_text = new_kw.clone();
+                        } else {
+                            let insert_pos = stars_node.end_byte();
+                            edit_range = insert_pos..insert_pos;
+                            new_text = format!(" {}", new_kw);
+                        }
+
+                        buffer.edit([(edit_range.clone(), new_text)], None, cx);
+
+                        // Add CLOSED timestamp on a separate line if needed
+                        if add_timestamp {
+                            let now = Local::now();
+                            let closed_line =
+                                format!("CLOSED: [{}]", now.format("%Y-%m-%d %a %H:%M"));
+                            // Insert after the headline
+                            buffer.edit(
+                                [(headline_end..headline_end, format!("\n{}", closed_line))],
+                                None,
+                                cx,
+                            );
+                        }
+                    }
+
+                    // Then insert the new recurring task
+                    // Note: insert_pos needs to be recalculated if we added a CLOSED line
+                    let final_insert_pos = if add_timestamp {
+                        // Account for the added CLOSED line
+                        insert_pos
+                            + format!("\nCLOSED: [{}]", Local::now().format("%Y-%m-%d %a %H:%M"))
+                                .len()
+                    } else {
+                        insert_pos
+                    };
+                    buffer.edit(
+                        [(final_insert_pos..final_insert_pos, new_task_headline)],
+                        None,
+                        cx,
+                    );
+                });
+
+                return;
+            }
+        }
+
+        // Normal cycling without recurring
         let edit_range;
         let new_text;
 
@@ -762,59 +871,242 @@ pub fn cycle_todo_state(
             if let Some(kw_node) = keyword_node {
                 // Replace existing keyword
                 edit_range = kw_node.byte_range();
-                new_text = if add_timestamp {
-                    let now = Local::now();
-                    format!("{} CLOSED: [{}]", new_kw, now.format("%Y-%m-%d %a %H:%M"))
-                } else {
-                    new_kw
-                };
+                new_text = new_kw.clone();
             } else {
                 // Insert new keyword after stars
                 let insert_pos = stars_node.end_byte();
                 edit_range = insert_pos..insert_pos;
                 new_text = format!(" {}", new_kw);
             }
-        } else {
-            // Remove keyword (and CLOSED timestamp if present)
-            if let Some(kw_node) = keyword_node {
-                let item_text = buffer_snapshot
-                    .text_for_range(item_node.byte_range())
-                    .collect::<String>();
 
-                // Check if there's a CLOSED timestamp to remove
-                if let Some(closed_pos) = item_text.find("CLOSED:") {
-                    if let Some(bracket_end) = item_text[closed_pos..].find(']') {
-                        // Remove from keyword start to end of timestamp
-                        let timestamp_end = item_node.start_byte() + closed_pos + bracket_end + 1;
+            // Apply the keyword change
+            singleton_buffer.update(cx, |buffer, cx| {
+                buffer.edit([(edit_range.clone(), new_text.clone())], None, cx);
+            });
 
-                        // Get the text after the timestamp and preserve it
-                        let after_timestamp = buffer_snapshot
-                            .text_for_range(timestamp_end..item_node.end_byte())
-                            .collect::<String>();
-
-                        edit_range = kw_node.start_byte()..timestamp_end;
-                        new_text = after_timestamp.trim_start().to_string();
-                    } else {
-                        // Just remove the keyword
-                        edit_range = kw_node.byte_range();
-                        new_text = String::new();
-                    }
-                } else {
-                    // Just remove the keyword
-                    edit_range = kw_node.byte_range();
-                    new_text = String::new();
-                }
-            } else {
-                // Nothing to do
-                return;
+            // Add CLOSED timestamp on a separate line if needed
+            if add_timestamp {
+                let now = Local::now();
+                let closed_line = format!("CLOSED: [{}]", now.format("%Y-%m-%d %a %H:%M"));
+                singleton_buffer.update(cx, |buffer, cx| {
+                    buffer.edit(
+                        [(
+                            headline_node.end_byte()..headline_node.end_byte(),
+                            format!("\n{}", closed_line),
+                        )],
+                        None,
+                        cx,
+                    );
+                });
             }
+
+            return;
+        } else {
+            // Remove keyword (and CLOSED timestamp line if present)
+            if let Some(kw_node) = keyword_node {
+                // Remove the keyword
+                singleton_buffer.update(cx, |buffer, cx| {
+                    buffer.edit([(kw_node.byte_range(), String::new())], None, cx);
+                });
+
+                // Also check for and remove CLOSED timestamp on the next line
+                let headline_end = headline_node.end_byte();
+                let buffer_text = buffer_snapshot.text();
+                let text_after_headline = &buffer_text[headline_end..];
+                let search_end = text_after_headline
+                    .find("\n*")
+                    .unwrap_or(text_after_headline.len());
+                let section_text = &text_after_headline[..search_end];
+
+                // Look for CLOSED line
+                if let Some(closed_pos) = section_text.find("CLOSED:") {
+                    if let Some(line_end) = section_text[closed_pos..].find('\n') {
+                        let closed_line_start = section_text[..closed_pos]
+                            .rfind('\n')
+                            .map(|p| p)
+                            .unwrap_or(0);
+                        let closed_line_end = closed_pos + line_end + 1;
+
+                        singleton_buffer.update(cx, |buffer, cx| {
+                            buffer.edit(
+                                [(
+                                    headline_end + closed_line_start
+                                        ..headline_end + closed_line_end,
+                                    String::new(),
+                                )],
+                                None,
+                                cx,
+                            );
+                        });
+                    } else {
+                        // CLOSED is at the end without newline
+                        let closed_line_start = section_text[..closed_pos]
+                            .rfind('\n')
+                            .map(|p| p)
+                            .unwrap_or(0);
+                        singleton_buffer.update(cx, |buffer, cx| {
+                            buffer.edit(
+                                [(
+                                    headline_end + closed_line_start
+                                        ..headline_end + section_text.len(),
+                                    String::new(),
+                                )],
+                                None,
+                                cx,
+                            );
+                        });
+                    }
+                }
+            }
+            return;
+        };
+    });
+}
+
+/// Extract recurring info from section text (SCHEDULED/DEADLINE with repeater)
+fn extract_recurring_info(
+    section_text: &str,
+) -> Option<(AgendaEntryType, chrono::NaiveDate, RepeaterInfo)> {
+    // Check for SCHEDULED with repeater
+    if let Some(scheduled_pos) = section_text.find("SCHEDULED:") {
+        let line = &section_text[scheduled_pos..].lines().next()?;
+        if let Some((date, repeater)) = parse_timestamp_with_repeater(line) {
+            return Some((AgendaEntryType::Scheduled, date, repeater));
+        }
+    }
+
+    // Check for DEADLINE with repeater
+    if let Some(deadline_pos) = section_text.find("DEADLINE:") {
+        let line = &section_text[deadline_pos..].lines().next()?;
+        if let Some((date, repeater)) = parse_timestamp_with_repeater(line) {
+            return Some((AgendaEntryType::Deadline, date, repeater));
+        }
+    }
+
+    None
+}
+
+/// Parse a timestamp line and extract date and repeater info
+fn parse_timestamp_with_repeater(line: &str) -> Option<(chrono::NaiveDate, RepeaterInfo)> {
+    use regex::Regex;
+
+    // Match patterns like: <2025-01-15 Wed +1w> or <2025-01-15 Wed ++2d> or <2025-01-15 Wed .+1m>
+    let re = Regex::new(r"<(\d{4}-\d{2}-\d{2})\s+\w+\s+([\+\.]{1,2})(\d+)([dwmy])>").ok()?;
+
+    if let Some(captures) = re.captures(line) {
+        let date_str = captures.get(1)?.as_str();
+        let repeater_prefix = captures.get(2)?.as_str();
+        let interval_str = captures.get(3)?.as_str();
+        let unit_str = captures.get(4)?.as_str();
+
+        let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
+        let interval = interval_str.parse::<i64>().ok()?;
+
+        let repeater_type = match repeater_prefix {
+            "+" => RepeaterType::Cumulative,
+            "++" => RepeaterType::CatchUp,
+            ".+" => RepeaterType::Restart,
+            _ => return None,
         };
 
-        // Apply the edit
-        singleton_buffer.update(cx, |buffer, cx| {
-            buffer.edit([(edit_range, new_text)], None, cx);
-        });
-    });
+        let unit = match unit_str {
+            "d" => RepeaterUnit::Day,
+            "w" => RepeaterUnit::Week,
+            "m" => RepeaterUnit::Month,
+            "y" => RepeaterUnit::Year,
+            _ => return None,
+        };
+
+        Some((
+            date,
+            RepeaterInfo {
+                interval,
+                unit,
+                repeater_type,
+            },
+        ))
+    } else {
+        None
+    }
+}
+
+/// Create a new recurring task with updated timestamp
+fn create_recurring_task(
+    original_headline: &str,
+    todo_keyword: &str,
+    next_date: chrono::NaiveDate,
+    repeater: &RepeaterInfo,
+    entry_type: AgendaEntryType,
+) -> String {
+    use regex::Regex;
+
+    // Remove any DONE/CANCELLED keyword
+    let re_done = Regex::new(r"(DONE|CANCELLED)\s*").unwrap();
+    let mut new_headline = re_done.replace_all(original_headline, "").to_string();
+
+    // Remove CLOSED timestamp line (it's on a separate line)
+    let re_closed = Regex::new(r"\n\s*CLOSED:\s*\[.*?\]").unwrap();
+    new_headline = re_closed.replace_all(&new_headline, "").to_string();
+
+    // Replace with TODO keyword if not present
+    if !new_headline.contains(todo_keyword) {
+        // Find the stars and insert TODO after them
+        if let Some(stars_end) = new_headline.find('*').and_then(|start| {
+            let rest = &new_headline[start..];
+            rest.find(|c: char| c != '*' && c != ' ')
+                .map(|offset| start + offset)
+        }) {
+            new_headline.insert_str(stars_end, &format!("{} ", todo_keyword));
+        }
+    }
+
+    // Build the repeater string
+    let repeater_str = format!(
+        "{}{}{}",
+        match repeater.repeater_type {
+            RepeaterType::Cumulative => "+",
+            RepeaterType::CatchUp => "++",
+            RepeaterType::Restart => ".+",
+        },
+        repeater.interval,
+        match repeater.unit {
+            RepeaterUnit::Day => "d",
+            RepeaterUnit::Week => "w",
+            RepeaterUnit::Month => "m",
+            RepeaterUnit::Year => "y",
+        }
+    );
+
+    let weekday = next_date.format("%a").to_string();
+    let timestamp_prefix = match entry_type {
+        AgendaEntryType::Scheduled => "SCHEDULED:",
+        AgendaEntryType::Deadline => "DEADLINE:",
+        _ => "SCHEDULED:",
+    };
+
+    // Update the timestamp in the headline text
+    let re_timestamp =
+        Regex::new(r"(SCHEDULED:|DEADLINE:)\s*<\d{4}-\d{2}-\d{2}\s+\w+\s+[\+\.]{1,2}\d+[dwmy]>")
+            .unwrap();
+
+    let new_timestamp = format!(
+        "{} <{} {} {}>",
+        timestamp_prefix,
+        next_date.format("%Y-%m-%d"),
+        weekday,
+        repeater_str
+    );
+
+    if re_timestamp.is_match(&new_headline) {
+        new_headline = re_timestamp
+            .replace(&new_headline, &new_timestamp)
+            .to_string();
+    } else {
+        // Add timestamp after the headline
+        new_headline.push_str(&format!("\n{}", new_timestamp));
+    }
+
+    format!("\n{}\n", new_headline)
 }
 
 fn format_reminder_duration(duration: std::time::Duration) -> String {
@@ -1071,7 +1363,7 @@ pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
     workspace.toggle_modal(window, cx, |window, cx| {
         DatePickerModal::new(
             tomorrow,
-            move |selected_date, reminder_duration, _window, cx| {
+            move |selected_date, reminder_duration, repeater_info, _window, cx| {
                 let Some(workspace) = workspace_weak.upgrade() else {
                     return;
                 };
@@ -1085,11 +1377,35 @@ pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
                     };
 
                     let weekday = selected_date.format("%a").to_string();
-                    let mut schedule_line = format!(
-                        "SCHEDULED: <{} {}>",
-                        selected_date.format("%Y-%m-%d"),
-                        weekday
-                    );
+                    let mut schedule_line = if let Some(repeater) = repeater_info {
+                        let repeater_str = format!(
+                            "{}{}{}",
+                            match repeater.repeater_type {
+                                RepeaterType::Cumulative => "+",
+                                RepeaterType::CatchUp => "++",
+                                RepeaterType::Restart => ".+",
+                            },
+                            repeater.interval,
+                            match repeater.unit {
+                                RepeaterUnit::Day => "d",
+                                RepeaterUnit::Week => "w",
+                                RepeaterUnit::Month => "m",
+                                RepeaterUnit::Year => "y",
+                            }
+                        );
+                        format!(
+                            "SCHEDULED: <{} {} {}>",
+                            selected_date.format("%Y-%m-%d"),
+                            weekday,
+                            repeater_str
+                        )
+                    } else {
+                        format!(
+                            "SCHEDULED: <{} {}>",
+                            selected_date.format("%Y-%m-%d"),
+                            weekday
+                        )
+                    };
 
                     // Add REMIND line if reminder was selected
                     if let Some(duration) = reminder_duration {
@@ -1143,18 +1459,21 @@ pub fn schedule_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
                                 let before_scheduled = &section_text[..scheduled_pos];
                                 let after_scheduled = &section_text[scheduled_pos..];
 
+                                // Find the start of the line (after the newline, not including it)
                                 let line_start = before_scheduled
                                     .rfind('\n')
-                                    .map(|pos| headline_end + pos)
+                                    .map(|pos| headline_end + pos + 1) // +1 to skip the newline
                                     .unwrap_or(headline_end);
+
+                                // Find the end of the line (including the newline)
                                 let line_end = after_scheduled
                                     .find('\n')
                                     .map(|pos| abs_scheduled_start + pos + 1)
                                     .unwrap_or(headline_end + section_text.len());
 
-                                // Replace the entire line, ensuring proper newlines
+                                // Replace the entire line
                                 buffer.edit(
-                                    [(line_start..line_end, format!("\n{}\n", schedule_line))],
+                                    [(line_start..line_end, format!("{}\n", schedule_line))],
                                     None,
                                     cx,
                                 );
@@ -1194,7 +1513,7 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
     workspace.toggle_modal(window, cx, |window, cx| {
         DatePickerModal::new(
             deadline_date,
-            move |selected_date, reminder_duration, _window, cx| {
+            move |selected_date, reminder_duration, repeater_info, _window, cx| {
                 let Some(workspace) = workspace_weak.upgrade() else {
                     return;
                 };
@@ -1208,11 +1527,35 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
                     };
 
                     let weekday = selected_date.format("%a").to_string();
-                    let mut deadline_line = format!(
-                        "DEADLINE: <{} {}>",
-                        selected_date.format("%Y-%m-%d"),
-                        weekday
-                    );
+                    let mut deadline_line = if let Some(repeater) = repeater_info {
+                        let repeater_str = format!(
+                            "{}{}{}",
+                            match repeater.repeater_type {
+                                RepeaterType::Cumulative => "+",
+                                RepeaterType::CatchUp => "++",
+                                RepeaterType::Restart => ".+",
+                            },
+                            repeater.interval,
+                            match repeater.unit {
+                                RepeaterUnit::Day => "d",
+                                RepeaterUnit::Week => "w",
+                                RepeaterUnit::Month => "m",
+                                RepeaterUnit::Year => "y",
+                            }
+                        );
+                        format!(
+                            "DEADLINE: <{} {} {}>",
+                            selected_date.format("%Y-%m-%d"),
+                            weekday,
+                            repeater_str
+                        )
+                    } else {
+                        format!(
+                            "DEADLINE: <{} {}>",
+                            selected_date.format("%Y-%m-%d"),
+                            weekday
+                        )
+                    };
 
                     // Add REMIND line if reminder was selected
                     if let Some(duration) = reminder_duration {
@@ -1266,18 +1609,21 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
                                 let before_deadline = &section_text[..deadline_pos];
                                 let after_deadline = &section_text[deadline_pos..];
 
+                                // Find the start of the line (after the newline, not including it)
                                 let line_start = before_deadline
                                     .rfind('\n')
-                                    .map(|pos| headline_end + pos)
+                                    .map(|pos| headline_end + pos + 1) // +1 to skip the newline
                                     .unwrap_or(headline_end);
+
+                                // Find the end of the line (including the newline)
                                 let line_end = after_deadline
                                     .find('\n')
                                     .map(|pos| abs_deadline_start + pos + 1)
                                     .unwrap_or(headline_end + section_text.len());
 
-                                // Replace the entire line, ensuring proper newlines
+                                // Replace the entire line
                                 buffer.edit(
-                                    [(line_start..line_end, format!("\n{}\n", deadline_line))],
+                                    [(line_start..line_end, format!("{}\n", deadline_line))],
                                     None,
                                     cx,
                                 );
@@ -1288,6 +1634,213 @@ pub fn set_deadline(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
                                         headline_end..headline_end,
                                         format!("\n{}\n", deadline_line),
                                     )],
+                                    None,
+                                    cx,
+                                );
+                            }
+                        });
+                    });
+                });
+            },
+            window,
+            cx,
+        )
+    });
+}
+
+pub fn set_recurring(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        return;
+    };
+
+    // First, find if there's an existing SCHEDULED or DEADLINE timestamp
+    let Some((existing_date, existing_type, existing_repeater)) =
+        editor.read_with(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx);
+            let Some(singleton_buffer) = buffer.as_singleton() else {
+                return None;
+            };
+
+            let buffer_snapshot = singleton_buffer.read(cx).snapshot();
+            let cursor_position = editor.selections.newest_anchor().head();
+            let buffer_anchor = cursor_position.text_anchor;
+            let buffer_offset = buffer_anchor.to_offset(&buffer_snapshot);
+
+            // Find the headline node
+            let headline_node = buffer_snapshot.syntax_ancestor(buffer_offset..buffer_offset)?;
+            let mut headline_node = headline_node;
+
+            while headline_node.kind() != "headline" {
+                headline_node = headline_node.parent()?;
+            }
+
+            // Get the section text after the headline
+            let headline_end = headline_node.end_byte();
+            let buffer_text = buffer_snapshot.text();
+            let text_after_headline = &buffer_text[headline_end..];
+            let search_end = text_after_headline
+                .find("\n*")
+                .unwrap_or(text_after_headline.len());
+            let section_text = &text_after_headline[..search_end];
+
+            // Check for existing SCHEDULED or DEADLINE
+            if let Some((entry_type, date, repeater)) = extract_recurring_info(section_text) {
+                Some((date, entry_type, Some(repeater)))
+            } else {
+                // Check for non-recurring SCHEDULED or DEADLINE
+                use regex::Regex;
+
+                if let Some(scheduled_pos) = section_text.find("SCHEDULED:") {
+                    let line = section_text[scheduled_pos..].lines().next()?;
+                    let re = Regex::new(r"<(\d{4}-\d{2}-\d{2})\s+\w+>").ok()?;
+                    if let Some(captures) = re.captures(line) {
+                        let date_str = captures.get(1)?.as_str();
+                        let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
+                        return Some((date, AgendaEntryType::Scheduled, None));
+                    }
+                }
+
+                if let Some(deadline_pos) = section_text.find("DEADLINE:") {
+                    let line = section_text[deadline_pos..].lines().next()?;
+                    let re = Regex::new(r"<(\d{4}-\d{2}-\d{2})\s+\w+>").ok()?;
+                    if let Some(captures) = re.captures(line) {
+                        let date_str = captures.get(1)?.as_str();
+                        let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
+                        return Some((date, AgendaEntryType::Deadline, None));
+                    }
+                }
+
+                None
+            }
+        })
+    else {
+        log::warn!("No SCHEDULED or DEADLINE timestamp found on current task");
+        return;
+    };
+
+    let workspace_weak = cx.entity().downgrade();
+    let entry_type_clone = existing_type.clone();
+
+    workspace.toggle_modal(window, cx, |window, cx| {
+        DatePickerModal::new_with_repeater(
+            existing_date,
+            existing_repeater,
+            move |selected_date, _reminder_duration, repeater_info, _window, cx| {
+                let entry_type = entry_type_clone.clone();
+                let Some(workspace) = workspace_weak.upgrade() else {
+                    return;
+                };
+
+                workspace.update(cx, |workspace, cx| {
+                    let Some(editor) = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                    else {
+                        return;
+                    };
+
+                    editor.update(cx, |editor, cx| {
+                        let buffer = editor.buffer().read(cx);
+                        let Some(singleton_buffer) = buffer.as_singleton() else {
+                            return;
+                        };
+
+                        let buffer_snapshot = singleton_buffer.read(cx).snapshot();
+                        let cursor_position = editor.selections.newest_anchor().head();
+                        let buffer_anchor = cursor_position.text_anchor;
+                        let buffer_offset = buffer_anchor.to_offset(&buffer_snapshot);
+
+                        let headline_node =
+                            buffer_snapshot.syntax_ancestor(buffer_offset..buffer_offset);
+                        let Some(mut headline_node) = headline_node else {
+                            return;
+                        };
+
+                        while headline_node.kind() != "headline" {
+                            if let Some(parent) = headline_node.parent() {
+                                headline_node = parent;
+                            } else {
+                                return;
+                            }
+                        }
+
+                        let headline_end = headline_node.end_byte();
+                        let buffer_text = buffer_snapshot.text();
+                        let text_after_headline = &buffer_text[headline_end..];
+                        let search_end = text_after_headline
+                            .find("\n*")
+                            .unwrap_or(text_after_headline.len());
+                        let section_text = &text_after_headline[..search_end];
+
+                        let weekday = selected_date.format("%a").to_string();
+                        let timestamp_prefix = match entry_type {
+                            AgendaEntryType::Scheduled => "SCHEDULED:",
+                            AgendaEntryType::Deadline => "DEADLINE:",
+                            _ => "SCHEDULED:",
+                        };
+
+                        let new_timestamp = if let Some(repeater) = repeater_info {
+                            let repeater_str = format!(
+                                "{}{}{}",
+                                match repeater.repeater_type {
+                                    RepeaterType::Cumulative => "+",
+                                    RepeaterType::CatchUp => "++",
+                                    RepeaterType::Restart => ".+",
+                                },
+                                repeater.interval,
+                                match repeater.unit {
+                                    RepeaterUnit::Day => "d",
+                                    RepeaterUnit::Week => "w",
+                                    RepeaterUnit::Month => "m",
+                                    RepeaterUnit::Year => "y",
+                                }
+                            );
+                            format!(
+                                "{} <{} {} {}>",
+                                timestamp_prefix,
+                                selected_date.format("%Y-%m-%d"),
+                                weekday,
+                                repeater_str
+                            )
+                        } else {
+                            format!(
+                                "{} <{} {}>",
+                                timestamp_prefix,
+                                selected_date.format("%Y-%m-%d"),
+                                weekday
+                            )
+                        };
+
+                        singleton_buffer.update(cx, |buffer, cx| {
+                            // Find and replace the existing timestamp line
+                            let prefix = match entry_type {
+                                AgendaEntryType::Scheduled => "SCHEDULED:",
+                                AgendaEntryType::Deadline => "DEADLINE:",
+                                _ => "SCHEDULED:",
+                            };
+
+                            if let Some(timestamp_pos) = section_text.find(prefix) {
+                                let abs_timestamp_start = headline_end + timestamp_pos;
+                                let before_timestamp = &section_text[..timestamp_pos];
+                                let after_timestamp = &section_text[timestamp_pos..];
+
+                                // Find the start of the line (after the newline, not including it)
+                                let line_start = before_timestamp
+                                    .rfind('\n')
+                                    .map(|pos| headline_end + pos + 1) // +1 to skip the newline
+                                    .unwrap_or(headline_end);
+
+                                // Find the end of the line (including the newline)
+                                let line_end = after_timestamp
+                                    .find('\n')
+                                    .map(|pos| abs_timestamp_start + pos + 1)
+                                    .unwrap_or(headline_end + section_text.len());
+
+                                buffer.edit(
+                                    [(line_start..line_end, format!("{}\n", new_timestamp))],
                                     None,
                                     cx,
                                 );
@@ -2836,8 +3389,17 @@ impl PickerDelegate for TagPickerDelegate {
 pub struct DatePickerModal {
     selected_date: chrono::NaiveDate,
     selected_reminder: Option<std::time::Duration>,
+    selected_repeater: Option<RepeaterInfo>,
     on_confirm: Option<
-        Box<dyn FnOnce(chrono::NaiveDate, Option<std::time::Duration>, &mut Window, &mut App)>,
+        Box<
+            dyn FnOnce(
+                chrono::NaiveDate,
+                Option<std::time::Duration>,
+                Option<RepeaterInfo>,
+                &mut Window,
+                &mut App,
+            ),
+        >,
     >,
     focus_handle: FocusHandle,
 }
@@ -2845,8 +3407,13 @@ pub struct DatePickerModal {
 impl DatePickerModal {
     pub fn new(
         initial_date: chrono::NaiveDate,
-        on_confirm: impl FnOnce(chrono::NaiveDate, Option<std::time::Duration>, &mut Window, &mut App)
-        + 'static,
+        on_confirm: impl FnOnce(
+            chrono::NaiveDate,
+            Option<std::time::Duration>,
+            Option<RepeaterInfo>,
+            &mut Window,
+            &mut App,
+        ) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2856,6 +3423,32 @@ impl DatePickerModal {
         Self {
             selected_date: initial_date,
             selected_reminder: None,
+            selected_repeater: None,
+            on_confirm: Some(Box::new(on_confirm)),
+            focus_handle,
+        }
+    }
+
+    pub fn new_with_repeater(
+        initial_date: chrono::NaiveDate,
+        initial_repeater: Option<RepeaterInfo>,
+        on_confirm: impl FnOnce(
+            chrono::NaiveDate,
+            Option<std::time::Duration>,
+            Option<RepeaterInfo>,
+            &mut Window,
+            &mut App,
+        ) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+
+        Self {
+            selected_date: initial_date,
+            selected_reminder: None,
+            selected_repeater: initial_repeater,
             on_confirm: Some(Box::new(on_confirm)),
             focus_handle,
         }
@@ -2873,6 +3466,72 @@ impl DatePickerModal {
         cx.notify();
     }
 
+    fn cycle_repeater(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // Cycle through common recurring patterns
+        // None -> +1d -> +1w -> +2w -> +1m -> +3m -> +1y -> ++1d -> ++1w -> .+1d -> .+1w -> None
+        self.selected_repeater = match &self.selected_repeater {
+            None => Some(RepeaterInfo {
+                interval: 1,
+                unit: RepeaterUnit::Day,
+                repeater_type: RepeaterType::Cumulative,
+            }),
+            Some(r) if r.repeater_type == RepeaterType::Cumulative => match (&r.unit, r.interval) {
+                (RepeaterUnit::Day, 1) => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Week,
+                    repeater_type: RepeaterType::Cumulative,
+                }),
+                (RepeaterUnit::Week, 1) => Some(RepeaterInfo {
+                    interval: 2,
+                    unit: RepeaterUnit::Week,
+                    repeater_type: RepeaterType::Cumulative,
+                }),
+                (RepeaterUnit::Week, 2) => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Month,
+                    repeater_type: RepeaterType::Cumulative,
+                }),
+                (RepeaterUnit::Month, 1) => Some(RepeaterInfo {
+                    interval: 3,
+                    unit: RepeaterUnit::Month,
+                    repeater_type: RepeaterType::Cumulative,
+                }),
+                (RepeaterUnit::Month, 3) => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Year,
+                    repeater_type: RepeaterType::Cumulative,
+                }),
+                _ => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Day,
+                    repeater_type: RepeaterType::CatchUp,
+                }),
+            },
+            Some(r) if r.repeater_type == RepeaterType::CatchUp => match (&r.unit, r.interval) {
+                (RepeaterUnit::Day, 1) => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Week,
+                    repeater_type: RepeaterType::CatchUp,
+                }),
+                _ => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Day,
+                    repeater_type: RepeaterType::Restart,
+                }),
+            },
+            Some(r) if r.repeater_type == RepeaterType::Restart => match (&r.unit, r.interval) {
+                (RepeaterUnit::Day, 1) => Some(RepeaterInfo {
+                    interval: 1,
+                    unit: RepeaterUnit::Week,
+                    repeater_type: RepeaterType::Restart,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        cx.notify();
+    }
+
     fn adjust_date(&mut self, days: i64, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(new_date) = self
             .selected_date
@@ -2885,7 +3544,13 @@ impl DatePickerModal {
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(on_confirm) = self.on_confirm.take() {
-            on_confirm(self.selected_date, self.selected_reminder, window, cx);
+            on_confirm(
+                self.selected_date,
+                self.selected_reminder,
+                self.selected_repeater.clone(),
+                window,
+                cx,
+            );
             cx.emit(DismissEvent);
         }
     }
@@ -2923,6 +3588,15 @@ impl DatePickerModal {
     ) {
         self.cycle_reminder(window, cx);
     }
+
+    fn cycle_repeater_action(
+        &mut self,
+        _: &DatePickerCycleRepeater,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_repeater(window, cx);
+    }
 }
 
 impl Render for DatePickerModal {
@@ -2948,6 +3622,44 @@ impl Render for DatePickerModal {
             }
         };
 
+        let repeater_text = match &self.selected_repeater {
+            None => "None".to_string(),
+            Some(r) => {
+                let prefix = match r.repeater_type {
+                    RepeaterType::Cumulative => "+",
+                    RepeaterType::CatchUp => "++",
+                    RepeaterType::Restart => ".+",
+                };
+                let unit = match r.unit {
+                    RepeaterUnit::Day => "day",
+                    RepeaterUnit::Week => "week",
+                    RepeaterUnit::Month => "month",
+                    RepeaterUnit::Year => "year",
+                };
+                let unit_plural = if r.interval == 1 {
+                    unit
+                } else {
+                    match r.unit {
+                        RepeaterUnit::Day => "days",
+                        RepeaterUnit::Week => "weeks",
+                        RepeaterUnit::Month => "months",
+                        RepeaterUnit::Year => "years",
+                    }
+                };
+                format!(
+                    "{}{} {} ({})",
+                    prefix,
+                    r.interval,
+                    unit_plural,
+                    match r.repeater_type {
+                        RepeaterType::Cumulative => "from date",
+                        RepeaterType::CatchUp => "catch up",
+                        RepeaterType::Restart => "from completion",
+                    }
+                )
+            }
+        };
+
         v_flex()
             .key_context("DatePickerModal")
             .track_focus(&self.focus_handle)
@@ -2960,6 +3672,7 @@ impl Render for DatePickerModal {
             .on_action(cx.listener(Self::prev_week))
             .on_action(cx.listener(Self::next_week))
             .on_action(cx.listener(Self::cycle_reminder_action))
+            .on_action(cx.listener(Self::cycle_repeater_action))
             .p_4()
             .gap_2()
             .child(
@@ -3002,6 +3715,30 @@ impl Render for DatePickerModal {
                         )
                         .child(
                             Label::new("Press 'r' to cycle reminder options")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                ),
+            )
+            .child(
+                h_flex().justify_center().gap_2().mt_2().child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Label::new("Recurring:").size(LabelSize::Small))
+                                .child(Label::new(repeater_text).size(LabelSize::Small).color(
+                                    if self.selected_repeater.is_some() {
+                                        Color::Accent
+                                    } else {
+                                        Color::Muted
+                                    },
+                                )),
+                        )
+                        .child(
+                            Label::new("Press 'p' to cycle repeater options")
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         ),
@@ -3258,8 +3995,7 @@ impl AgendaView {
         let options = DeadlineNotification::window_options(display, cx);
 
         // Open the notification window
-        // The notification handles button clicks internally
-        let _ = cx.open_window(options, |_window, cx| {
+        if let Ok(notification_window) = cx.open_window(options, |_, cx| {
             cx.new(|_| {
                 DeadlineNotification::new(
                     task_name.clone(),
@@ -3270,7 +4006,38 @@ impl AgendaView {
                     workspace.downgrade(),
                 )
             })
-        });
+        }) {
+            // Get the notification entity from the window
+            if let Ok(notification_entity) = notification_window.entity(cx) {
+                // Clone the window handle for the subscription closure
+                let window_handle = notification_window.clone();
+
+                // Subscribe to notification events and close the window when dismissed/accepted
+                cx.subscribe(
+                    &notification_entity,
+                    move |_this, _notification, event, cx| {
+                        match event {
+                            DeadlineNotificationEvent::Accepted => {
+                                // TODO: Open the task in the editor
+                                window_handle
+                                    .update(cx, |_, window, _| {
+                                        window.remove_window();
+                                    })
+                                    .ok();
+                            }
+                            DeadlineNotificationEvent::Dismissed => {
+                                window_handle
+                                    .update(cx, |_, window, _| {
+                                        window.remove_window();
+                                    })
+                                    .ok();
+                            }
+                        }
+                    },
+                )
+                .detach();
+            }
+        }
 
         // Also show a toast as backup
         let message = format!("⏰ Reminder {}: {} ({})", urgency, task_name, deadline_date);

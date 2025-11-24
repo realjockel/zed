@@ -174,8 +174,6 @@ impl Render for DeadlineNotification {
                                 cx.listener(move |_this, _event, _window, cx| {
                                     // Emit event to signal that user wants to view the task
                                     cx.emit(DeadlineNotificationEvent::Accepted);
-                                    // Close this notification window
-                                    cx.quit();
                                 })
                             }),
                     )
@@ -183,8 +181,6 @@ impl Render for DeadlineNotification {
                         cx.listener(move |_, _event, _window, cx| {
                             // Emit event to signal dismissal
                             cx.emit(DeadlineNotificationEvent::Dismissed);
-                            // Close this notification window
-                            cx.quit();
                         })
                     })),
             )
