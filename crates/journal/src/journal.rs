@@ -770,18 +770,20 @@ pub fn cycle_todo_state(
 
         // If transitioning to done, check for recurring timestamps
         if transitioning_to_done {
-            // Check the section for SCHEDULED or DEADLINE with repeater
-            let headline_end = headline_node.end_byte();
-            let buffer_text = buffer_snapshot.text();
-            let text_after_headline = &buffer_text[headline_end..];
-            let search_end = text_after_headline
-                .find("\n*")
-                .unwrap_or(text_after_headline.len());
-            let section_text = &text_after_headline[..search_end];
+            // Find the section node that contains this headline
+            let section_node = if headline_node.parent().map(|p| p.kind()) == Some("section") {
+                headline_node.parent().unwrap()
+            } else {
+                headline_node
+            };
+
+            // Use tree-sitter to find recurring timestamps
+            let recurring_info = extract_recurring_info_from_node(section_node, &buffer_snapshot);
 
             // Look for recurring timestamps
-            if let Some((entry_type, current_date, repeater)) = extract_recurring_info(section_text)
-            {
+            if let Some((entry_type, current_date, repeater)) = recurring_info {
+                let headline_end = headline_node.end_byte();
+
                 // Clone the headline text for the new task
                 let headline_text = buffer_snapshot
                     .text_for_range(headline_node.byte_range())
@@ -803,12 +805,8 @@ pub fn cycle_todo_state(
                     entry_type,
                 );
 
-                // Get insertion position - after the entire headline section
-                let insert_pos = headline_end
-                    + section_text
-                        .find("\n*")
-                        .map(|p| p + 1)
-                        .unwrap_or(section_text.len());
+                // Get insertion position - after the section node
+                let insert_pos = section_node.end_byte();
 
                 // Apply the status change and insert new task
                 singleton_buffer.update(cx, |buffer, cx| {
@@ -963,7 +961,139 @@ pub fn cycle_todo_state(
     });
 }
 
+/// Extract recurring info using tree-sitter from a section node
+fn extract_recurring_info_from_node(
+    section_node: tree_sitter::Node,
+    buffer: &language::BufferSnapshot,
+) -> Option<(AgendaEntryType, chrono::NaiveDate, RepeaterInfo)> {
+    // Walk through the section looking for plan nodes (SCHEDULED/DEADLINE)
+    fn visit_node<'a>(
+        node: tree_sitter::Node<'a>,
+        buffer: &language::BufferSnapshot,
+    ) -> Option<(AgendaEntryType, chrono::NaiveDate, RepeaterInfo)> {
+        if node.kind() == "plan" {
+            // Plan node contains SCHEDULED: or DEADLINE: followed by timestamp
+            let plan_text = buffer.text_for_range(node.byte_range()).collect::<String>();
+
+            let entry_type = if plan_text.starts_with("SCHEDULED:") {
+                AgendaEntryType::Scheduled
+            } else if plan_text.starts_with("DEADLINE:") {
+                AgendaEntryType::Deadline
+            } else {
+                return None;
+            };
+
+            // Look for timestamp child with repeat child
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "timestamp" {
+                    if let Some((date, repeater)) = parse_timestamp_node(child, buffer) {
+                        return Some((entry_type, date, repeater));
+                    }
+                }
+            }
+        }
+
+        // Recursively check children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(result) = visit_node(child, buffer) {
+                return Some(result);
+            }
+        }
+
+        None
+    }
+
+    visit_node(section_node, buffer)
+}
+
+/// Parse a timestamp tree-sitter node and extract date and repeater info
+fn parse_timestamp_node(
+    timestamp_node: tree_sitter::Node,
+    buffer: &language::BufferSnapshot,
+) -> Option<(chrono::NaiveDate, RepeaterInfo)> {
+    let mut date_str: Option<String> = None;
+    let mut repeater_info: Option<RepeaterInfo> = None;
+
+    let mut cursor = timestamp_node.walk();
+    for child in timestamp_node.children(&mut cursor) {
+        match child.kind() {
+            "date" => {
+                date_str = Some(
+                    buffer
+                        .text_for_range(child.byte_range())
+                        .collect::<String>(),
+                );
+            }
+            "repeat" => {
+                // The repeat node contains the repeater string like "+1w"
+                let repeat_text = buffer
+                    .text_for_range(child.byte_range())
+                    .collect::<String>();
+                repeater_info = parse_repeater_text(&repeat_text);
+            }
+            _ => {}
+        }
+    }
+
+    if let (Some(date_s), Some(repeater)) = (date_str, repeater_info) {
+        let date = chrono::NaiveDate::parse_from_str(&date_s, "%Y-%m-%d").ok()?;
+        Some((date, repeater))
+    } else {
+        None
+    }
+}
+
+/// Parse repeater text like "+1w", "++2d", ".+1m"
+fn parse_repeater_text(text: &str) -> Option<RepeaterInfo> {
+    let text = text.trim();
+
+    // Match patterns: +, ++, or .+
+    let (repeater_type, rest) = if text.starts_with(".+") {
+        (RepeaterType::Restart, &text[2..])
+    } else if text.starts_with("++") {
+        (RepeaterType::CatchUp, &text[2..])
+    } else if text.starts_with('+') {
+        (RepeaterType::Cumulative, &text[1..])
+    } else {
+        return None;
+    };
+
+    // Parse number and unit
+    let mut num_end = 0;
+    for (i, ch) in rest.chars().enumerate() {
+        if ch.is_ascii_digit() {
+            num_end = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    if num_end == 0 {
+        return None;
+    }
+
+    let interval = rest[..num_end].parse::<i64>().ok()?;
+    let unit_char = rest.chars().nth(num_end)?;
+
+    let unit = match unit_char {
+        'd' => RepeaterUnit::Day,
+        'w' => RepeaterUnit::Week,
+        'm' => RepeaterUnit::Month,
+        'y' => RepeaterUnit::Year,
+        _ => return None,
+    };
+
+    Some(RepeaterInfo {
+        interval,
+        unit,
+        repeater_type,
+    })
+}
+
 /// Extract recurring info from section text (SCHEDULED/DEADLINE with repeater)
+/// Legacy regex-based version - kept for fallback
 fn extract_recurring_info(
     section_text: &str,
 ) -> Option<(AgendaEntryType, chrono::NaiveDate, RepeaterInfo)> {
@@ -4015,10 +4145,19 @@ impl AgendaView {
                 // Subscribe to notification events and close the window when dismissed/accepted
                 cx.subscribe(
                     &notification_entity,
-                    move |_this, _notification, event, cx| {
+                    move |_this, notification, event, cx| {
                         match event {
                             DeadlineNotificationEvent::Accepted => {
-                                // TODO: Open the task in the editor
+                                // TODO: Implement file opening and navigation
+                                // The file path and line number are stored in the notification
+                                // but require window context which is complex to access from
+                                // async app subscription context
+                                log::info!(
+                                    "User wants to view task: {} line {}",
+                                    notification.read(cx).file_path.display(),
+                                    notification.read(cx).line_number
+                                );
+
                                 window_handle
                                     .update(cx, |_, window, _| {
                                         window.remove_window();

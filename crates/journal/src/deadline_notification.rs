@@ -16,7 +16,7 @@ pub struct DeadlineNotification {
     urgency: SharedString,
     pub file_path: PathBuf,
     pub line_number: u32,
-    workspace: WeakEntity<Workspace>,
+    pub workspace: WeakEntity<Workspace>,
 }
 
 impl DeadlineNotification {
